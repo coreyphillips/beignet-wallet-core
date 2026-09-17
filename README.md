@@ -64,3 +64,7 @@ if (wallets.length) wallet.selectWallet(wallets[0].id);
 ```
 
 The runtime accepts `request({method,path,body})` and returns raw command results. It owns wallet creation, local seed/database storage, networking and the durable payment journal. `EmbeddedWalletClient` performs no HTTP calls and supplies no fake engine or silent host fallback. It reuses the same amount parsing, review binding, fee limits, single-use dispatch, uncertain-result handling and activity normalization as host mode.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
