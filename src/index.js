@@ -258,6 +258,7 @@ function publicStoredRequest(value) {
           .map((w) => w.slice(0, 512))
       : [],
     ...(Number.isFinite(value.createdAt) ? { createdAt: value.createdAt } : {}),
+    ...(value.offlineReceive === true ? { offlineReceive: true } : {}),
     bitcoinTracking: lightningOnly
       ? "lightning-only"
       : value.bitcoinTracking === "ambiguous"
@@ -1632,13 +1633,21 @@ export class WalletClient {
         p.pubkey === rec.lfbw.primaryPubkey &&
         (p.connected || p.state === "connected" || p.state === "ready"),
     );
-    const plan = planInvoice({
+    let plan = planInvoice({
       wantedSats: amount || 0,
       channels,
       primaryPubkey: rec.lfbw.primaryPubkey,
       setup: rec.lfbw.setup,
       primaryConnected: connected,
     });
+    let offlineQuote;
+    const config = this.embedded ? await this.getConfig() : {};
+    if (config.offlineReceiveAvailable) {
+      requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
+      offlineQuote = await this._get(`/receive/quote?amountSats=${amount}`);
+      requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
+      plan = { kind: "offline" };
+    }
     requires(
       plan.kind !== "refuse",
       plan.code === "PRIMARY_DOWN"
@@ -1706,6 +1715,7 @@ export class WalletClient {
       plan: plan.kind,
       rec,
       feePolicy,
+      offlineQuote,
     });
     return quote;
   }
@@ -1753,8 +1763,10 @@ export class WalletClient {
     let invoice;
     try {
       invoice = await this._post(
-        held.plan === "jit" ? "/jit/invoice" : "/invoice/create",
-        held.plan === "jit"
+        held.plan === "offline" ? "/receive/invoice" : held.plan === "jit" ? "/jit/invoice" : "/invoice/create",
+        held.plan === "offline"
+          ? { ...body, requestId: quote.id, quote: held.offlineQuote }
+          : held.plan === "jit"
           ? {
               ...body,
               lspPubkey: held.rec.lfbw.primaryPubkey,
@@ -1774,6 +1786,7 @@ export class WalletClient {
       throw held.plan === "jit" ? jitReceiveError(error, "invoice") : error;
     }
     this._assertEpoch(epoch);
+    requires(held.plan !== "offline" || invoice?.offlineReceive === true, "Your payment request could not be verified. Check Activity before trying again.", "INVALID_RESPONSE");
     const parsed = parsePayment(invoice?.bolt11, { network: held.rec.network });
     requires(
       parsed.kind === "bolt11",
@@ -1828,7 +1841,7 @@ export class WalletClient {
       warnings.push(
         "This request accepts Lightning. Bitcoin receiving will be available again after an existing Bitcoin receive address is used.",
       );
-    else
+    else if (held.plan !== "offline")
       try {
         const f = await this._post("/direct-funding/request", {
           ...(amount != null ? { amountSats: amount } : {}),
@@ -1869,6 +1882,7 @@ export class WalletClient {
       ...(address ? { address } : {}),
       ...(lightningOnly ? { bitcoinTracking: "lightning-only" } : {}),
       bolt11: invoice.bolt11,
+      ...(invoice.offlineReceive === true ? { offlineReceive: true } : {}),
       paymentHash: decoded.paymentHash,
       amountSats: amount,
       description: quote.description,
