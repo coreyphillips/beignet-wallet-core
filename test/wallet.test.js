@@ -2976,3 +2976,24 @@ test("a unified request with an invoice and an envelope goes over Lightning when
   });
   await assert.rejects(broke.prepareSend({ request: unified() }));
 });
+
+test("embedded receiving prepares an offline invoice and preserves its coverage after saving", async () => {
+  const terms = { available:true, peer:PK, amountSats:10000, feeSats:0, terms:{feeBaseMsat:0,feePpm:0}, expiresAt:NOW+60000 };
+  const {client,calls}=embeddedFixture({
+    "/api/config":{offlineReceiveAvailable:true},
+    "/receive/quote":terms,
+    "/receive/invoice":{bolt11:INVOICE,paymentHash:HASH,offlineReceive:true},
+  });
+  const quote=await client.quoteReceive({amountSats:10000});
+  const request=await client.receive(quote);
+  assert.equal(request.offlineReceive,true);
+  const create=calls.find(c=>c.path==="/receive/invoice");
+  assert.deepEqual(create.body.quote,terms);assert.equal(create.body.requestId,quote.id);
+  assert.ok(!calls.some(c=>["/invoice/create","/jit/invoice","/direct-funding/request"].includes(c.path)));
+});
+test("unsupported offline provider never silently downgrades to an online-only invoice",async()=>{
+  const {client,calls}=embeddedFixture({"/api/config":{offlineReceiveAvailable:true},"/receive/quote":Object.assign(Error("Your node did not answer the receive request."),{code:"RECEIVE_UNAVAILABLE"})});
+  await assert.rejects(client.quoteReceive({amountSats:10000}),{code:"RECEIVE_UNAVAILABLE"});
+  assert.ok(!calls.some(c=>["/invoice/create","/jit/invoice","/address/new"].includes(c.path)));
+  await assert.rejects(client.quoteReceive({}),{code:"AMOUNT_REQUIRED"});
+});

@@ -136,6 +136,7 @@ export interface ReceiveQuote {
   warnings: string[];
 }
 export interface ReceiveRequest {
+  offlineReceive?: boolean;
   id: string;
   uri: string;
   address?: string;
@@ -196,6 +197,7 @@ export interface HostConfig {
   >;
   torAvailable: boolean;
   lfbwAvailable: boolean;
+  offlineReceiveAvailable?: boolean;
   jitQuoteAvailable?: boolean;
   recoveryAvailable?: boolean;
   engineVersion?: string;
