@@ -125,6 +125,13 @@ export interface SendResult {
 export interface ReceiveInput {
   amountSats?: number | string | null;
   description?: string;
+  /**
+   * Omit for the default, which is unified: ordinary Lightning over existing
+   * inbound, or JIT when the primary has to provide the capacity, with Bitcoin
+   * and direct funding when available. Offline is an opt-in on every surface:
+   * it requires advertised support and never falls back to unified.
+   */
+  mode?: "unified" | "offline";
 }
 export interface ReceiveQuote {
   id: string;
@@ -200,6 +207,7 @@ export interface HostConfig {
   offlineReceiveAvailable?: boolean;
   jitQuoteAvailable?: boolean;
   recoveryAvailable?: boolean;
+  recoveryAutoApplyAvailable?: boolean;
   engineVersion?: string;
 }
 export interface CreatedWallet extends WalletRecord {
@@ -214,6 +222,28 @@ export interface CreateWalletInput {
   electrum?: ElectrumServer;
   /** An existing recovery phrase to restore instead of generating a new one. */
   mnemonic?: string;
+  /** Explicit browser import opt-in. The previous wallet must be closed. */
+  recoveryAutoApply?: boolean;
+}
+/** Public recovery progress only, without capsules, keys or transport credentials. */
+export interface WalletRecoveryStatus {
+  mode: "off" | "peer-storage" | "async-remote" | "quorum";
+  state: "disabled" | "running" | "restore-required" | "restoring" | "restart-required" | "fenced";
+  importPending: boolean;
+  importComplete: boolean;
+  autoApply: {
+    enabled: boolean;
+    phase: "idle" | "settling" | "applying" | "applied" | "refused";
+    lastReason: string | null;
+  };
+  capsuleCount: number;
+  backupChannelCount: number | null;
+  channels: {
+    channelId: string;
+    status: string;
+    restoreRecencyUnproven: boolean;
+    fundingUnidentified: boolean;
+  }[];
 }
 /** One read of what the engine reports about itself, for the owner to inspect. */
 export interface WalletDiagnostics {
@@ -259,6 +289,7 @@ export interface WalletClientInterface {
   selectWallet(id: string): void;
   getConfig(): Promise<HostConfig>;
   getRecoveryPhrase(): Promise<string>;
+  getRecoveryStatus(): Promise<WalletRecoveryStatus>;
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
@@ -292,6 +323,7 @@ export class WalletClient implements WalletClientInterface {
   selectWallet(id: string): void;
   getConfig(): Promise<HostConfig>;
   getRecoveryPhrase(): Promise<string>;
+  getRecoveryStatus(): Promise<WalletRecoveryStatus>;
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
@@ -317,6 +349,7 @@ export class DemoWalletClient implements WalletClientInterface {
   selectWallet(id: string): void;
   getConfig(): Promise<HostConfig>;
   getRecoveryPhrase(): Promise<string>;
+  getRecoveryStatus(): Promise<WalletRecoveryStatus>;
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
