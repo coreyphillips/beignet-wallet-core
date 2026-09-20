@@ -2984,7 +2984,7 @@ test("embedded receiving prepares an offline invoice and preserves its coverage 
     "/receive/quote":terms,
     "/receive/invoice":{bolt11:INVOICE,paymentHash:HASH,offlineReceive:true},
   });
-  const quote=await client.quoteReceive({amountSats:10000});
+  const quote=await client.quoteReceive({amountSats:10000,mode:"offline"});
   const request=await client.receive(quote);
   assert.equal(request.offlineReceive,true);
   const create=calls.find(c=>c.path==="/receive/invoice");
@@ -2993,7 +2993,274 @@ test("embedded receiving prepares an offline invoice and preserves its coverage 
 });
 test("unsupported offline provider never silently downgrades to an online-only invoice",async()=>{
   const {client,calls}=embeddedFixture({"/api/config":{offlineReceiveAvailable:true},"/receive/quote":Object.assign(Error("Your node did not answer the receive request."),{code:"RECEIVE_UNAVAILABLE"})});
-  await assert.rejects(client.quoteReceive({amountSats:10000}),{code:"RECEIVE_UNAVAILABLE"});
+  await assert.rejects(client.quoteReceive({amountSats:10000,mode:"offline"}),{code:"RECEIVE_UNAVAILABLE"});
   assert.ok(!calls.some(c=>["/invoice/create","/jit/invoice","/address/new"].includes(c.path)));
-  await assert.rejects(client.quoteReceive({}),{code:"AMOUNT_REQUIRED"});
+  await assert.rejects(client.quoteReceive({mode:"offline"}),{code:"AMOUNT_REQUIRED"});
+});
+test("embedded receiving defaults to JIT with no channel and never asks the offline lane", async () => {
+  const { client, calls } = embeddedFixture({
+    "/api/config": { offlineReceiveAvailable: true },
+    "/channels": [],
+    "/jit/quote": {
+      accepted: true,
+      withinCeilings: true,
+      flatFeeSat: 10,
+      feePpm: 101,
+      feeSats: 12,
+    },
+  });
+  const quote = await client.quoteReceive({ amountSats: 10000 });
+  assert.equal(quote.netSats, 9988);
+  const request = await client.receive(quote);
+  assert.equal(request.offlineReceive, undefined);
+  assert.equal(request.feeSats, 12);
+  assert.equal(calls.find((call) => call.path === "/jit/invoice").body.feeMode, "skim");
+  assert.equal(
+    calls.filter((call) => call.path === "/direct-funding/request").length,
+    1,
+  );
+  assert.ok(
+    !calls.some((call) =>
+      ["/api/config", "/receive/quote", "/receive/invoice", "/invoice/create"].includes(call.path),
+    ),
+  );
+});
+test("embedded receiving defaults to a plain invoice over existing inbound", async () => {
+  const { client, calls } = embeddedFixture({
+    "/api/config": { offlineReceiveAvailable: true },
+  });
+  const quote = await client.quoteReceive({ amountSats: 10000 });
+  assert.equal(quote.feeSats, 0);
+  const request = await client.receive(quote);
+  assert.equal(request.offlineReceive, undefined);
+  assert.equal(calls.filter((call) => call.path === "/invoice/create").length, 1);
+  assert.ok(
+    !calls.some((call) =>
+      ["/api/config", "/receive/quote", "/receive/invoice", "/jit/quote", "/jit/invoice"].includes(call.path),
+    ),
+  );
+});
+
+test("explicit unified receive uses JIT and direct funding despite advertised offline support", async () => {
+  const { client, calls } = embeddedFixture({
+    "/api/config": { offlineReceiveAvailable: true },
+    "/channels": [],
+    "/jit/quote": {
+      accepted: true,
+      withinCeilings: true,
+      flatFeeSat: 10,
+      feePpm: 101,
+      feeSats: 12,
+    },
+  });
+  const quote = await client.quoteReceive({
+    amountSats: 10000,
+    mode: "unified",
+  });
+  assert.equal(quote.netSats, 9988);
+  assert.ok(calls.every((call) => call.method === "GET"));
+  await assert.rejects(client.receive({ ...quote, mode: "offline" }), {
+    code: "REVIEW_CHANGED",
+  });
+  const request = await client.receive(quote);
+  const parsed = parsePayment(request.uri, { network: "mainnet", now: NOW });
+  assert.equal(parsed.kind, "onchain");
+  assert.equal(parsed.address, ADDRESS);
+  assert.equal(parsed.lightning.invoice, INVOICE);
+  assert.equal(parsed.funding.amountSats, 10000);
+  assert.equal(request.feeSats, 12);
+  assert.equal(request.offlineReceive, undefined);
+  const body = calls.find((call) => call.path === "/jit/invoice").body;
+  assert.equal(body.feeMode, "skim");
+  assert.equal(body.maxFlatFeeSat, 10);
+  assert.equal(body.maxFeePpm, 101);
+  assert.equal(
+    calls.filter((call) => call.path === "/direct-funding/request").length,
+    1,
+  );
+  assert.ok(
+    !calls.some((call) =>
+      ["/receive/quote", "/receive/invoice", "/invoice/create"].includes(call.path),
+    ),
+  );
+  await assert.rejects(client.receive(quote), { code: "INVALID_REVIEW" });
+});
+
+test("explicit unified receive reuses inbound capacity and includes direct funding", async () => {
+  const { client, calls } = embeddedFixture({
+    "/api/config": { offlineReceiveAvailable: true },
+  });
+  const quote = await client.quoteReceive({
+    amountSats: 10000,
+    mode: "unified",
+  });
+  assert.equal(quote.feeSats, 0);
+  const request = await client.receive(quote);
+  const parsed = parsePayment(request.uri, { network: "mainnet", now: NOW });
+  assert.equal(parsed.kind, "onchain");
+  assert.equal(parsed.lightning.invoice, INVOICE);
+  assert.equal(parsed.funding.amountSats, 10000);
+  assert.equal(request.offlineReceive, undefined);
+  assert.equal(calls.filter((call) => call.path === "/invoice/create").length, 1);
+  assert.equal(
+    calls.filter((call) => call.path === "/direct-funding/request").length,
+    1,
+  );
+  assert.ok(
+    !calls.some((call) =>
+      ["/receive/quote", "/receive/invoice", "/jit/quote", "/jit/invoice"].includes(call.path),
+    ),
+  );
+});
+
+test("invalid receive modes fail before any network request", async () => {
+  for (const make of [fixture, embeddedFixture]) {
+    const { client, calls } = make();
+    for (const mode of ["auto", "", null, false, 1, {}]) {
+      await assert.rejects(client.quoteReceive({ amountSats: 10000, mode }), {
+        code: "INVALID_PARAMS",
+      });
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(client._receiveQuotes.size, 0);
+  }
+  await assert.rejects(
+    new DemoWalletClient().quoteReceive({ amountSats: 10000, mode: "auto" }),
+    { code: "INVALID_PARAMS" },
+  );
+});
+
+test("explicit offline receive requires advertised support without falling back", async () => {
+  for (const make of [fixture, embeddedFixture]) {
+    for (const advertised of [undefined, false, "true"]) {
+      const { client, calls } = make({
+        "/api/config": { offlineReceiveAvailable: advertised },
+      });
+      await assert.rejects(
+        client.quoteReceive({ amountSats: 10000, mode: "offline" }),
+        { code: "RECEIVE_UNAVAILABLE" },
+      );
+      assert.ok(calls.every((call) => call.method === "GET"));
+      assert.ok(
+        !calls.some((call) => ["/receive/quote", "/jit/quote"].includes(call.path)),
+      );
+      assert.equal(client._receiveQuotes.size, 0);
+    }
+  }
+  await assert.rejects(
+    new DemoWalletClient().quoteReceive({ amountSats: 10000, mode: "offline" }),
+    { code: "RECEIVE_UNAVAILABLE" },
+  );
+});
+
+test("explicit offline receive retains its reservation when advertised", async () => {
+  const terms = {
+    available: true,
+    peer: PK,
+    amountSats: 10000,
+    feeSats: 0,
+    terms: { feeBaseMsat: 0, feePpm: 0 },
+    expiresAt: NOW + 60000,
+  };
+  for (const make of [fixture, embeddedFixture]) {
+    const { client, calls } = make({
+      "/api/config": { offlineReceiveAvailable: true },
+      "/receive/quote": terms,
+      "/receive/invoice": {
+        bolt11: INVOICE,
+        paymentHash: HASH,
+        offlineReceive: true,
+      },
+    });
+    const quote = await client.quoteReceive({ amountSats: 10000, mode: "offline" });
+    const request = await client.receive(quote);
+    assert.equal(request.offlineReceive, true);
+    const create = calls.find((call) => call.path === "/receive/invoice");
+    assert.deepEqual(create.body.quote, terms);
+    assert.equal(create.body.requestId, quote.id);
+    assert.ok(
+      !calls.some((call) =>
+        ["/invoice/create", "/jit/invoice", "/direct-funding/request"].includes(call.path),
+      ),
+    );
+  }
+});
+
+test("channel recovery import requires an explicit phrase and supported browser engine", async () => {
+  const mnemonic = new Array(12).fill("fixture-only").join(" ");
+  const { client, calls } = embeddedFixture({
+    "/api/config": { recoveryAutoApplyAvailable: true },
+    "POST /api/wallets": { record, mnemonic },
+  });
+  const created = await client.createWallet({ mnemonic, recoveryAutoApply: true });
+  assert.equal(created.id, record.id);
+  const creations = calls.filter(c => c.path === "/api/wallets" && c.method === "POST");
+  assert.equal(creations.length, 1);
+  assert.equal(creations[0].body.recoveryAutoApply, true);
+  assert.equal(creations[0].body.mnemonic, mnemonic);
+  assert.equal(creations[0].body.recoveryMode, "peer-storage");
+  assert.equal(calls[0].path, "/api/config");
+  for (const make of [fixture, embeddedFixture]) {
+    const unsupported = make({ "/api/config": { recoveryAvailable: true } });
+    await assert.rejects(unsupported.client.createWallet({ mnemonic, recoveryAutoApply: true }), { code: "RECOVERY_UNAVAILABLE" });
+    assert.ok(unsupported.calls.every(c => c.method === "GET"));
+  }
+});
+
+test("invalid or empty import phrases never fall through to fresh wallet creation", async () => {
+  const { client, calls } = embeddedFixture();
+  for (const mnemonic of ["", "   ", null, 42, [], "too few words"]) {
+    await assert.rejects(client.createWallet({ mnemonic }), { code: "INVALID_MNEMONIC" });
+  }
+  await assert.rejects(client.createWallet({ recoveryAutoApply: true }), { code: "INVALID_MNEMONIC" });
+  await assert.rejects(client.createWallet({ recoveryAutoApply: "true" }), { code: "INVALID_PARAMS" });
+  assert.equal(calls.length, 0);
+  const demo = new DemoWalletClient();
+  await assert.rejects(demo.createWallet({ mnemonic: "fixture phrase" }), { code: "DEMO_ONLY" });
+});
+
+test("ordinary wallet creation never opts into automatic capsule import", async () => {
+  const { client, calls } = embeddedFixture({ "POST /api/wallets": { record } });
+  await client.createWallet();
+  const create = calls.find(c => c.path === "/api/wallets");
+  assert.equal("recoveryAutoApply" in create.body, false);
+  assert.equal("mnemonic" in create.body, false);
+});
+
+const recoveryFixture = () => ({
+  mode: "peer-storage", state: "running", importPending: false, importComplete: true,
+  autoApply: { enabled: true, phase: "idle", lastReason: null },
+  capsules: { candidates: 1, best: { channelCount: 1, secretCapsule: "not-for-ui" } },
+  guardians: [{ auth: "not-for-ui" }],
+  node: { channels: [{ channelId: HASH, status: "restore_recency_unproven", restoreRecencyUnproven: true, secret: "not-for-ui" }] },
+});
+
+test("recovery progress preserves restrictions across reopen and excludes private backup data", async () => {
+  const { client, calls } = embeddedFixture({ "/recovery/status": recoveryFixture() });
+  assert.deepEqual(await client.getRecoveryStatus(), {
+    mode: "peer-storage", state: "running", importPending: false, importComplete: true,
+    autoApply: { enabled: true, phase: "idle", lastReason: null },
+    capsuleCount: 1, backupChannelCount: 1,
+    channels: [{ channelId: HASH, status: "restore_recency_unproven", restoreRecencyUnproven: true, fundingUnidentified: false }],
+  });
+  assert.ok(calls.every(c => c.method === "GET"));
+  const demo = await new DemoWalletClient().getRecoveryStatus();
+  assert.equal(demo.state, "disabled");
+  assert.equal(demo.importComplete, false);
+});
+
+test("incomplete recovery status never appears successfully restored", async () => {
+  for (const bad of [null, {}, { ...recoveryFixture(), autoApply: {} },
+    { ...recoveryFixture(), node: { channels: [{ channelId: "bad", status: "ready" }] } }]) {
+    const { client } = embeddedFixture({ "/recovery/status": () => bad });
+    await assert.rejects(client.getRecoveryStatus(), { code: "INVALID_RESPONSE" });
+  }
+});
+
+test("recovery progress rejects an answer from a previously selected wallet", async () => {
+  const { client } = embeddedFixture({ "/recovery/status": () => {
+    client.selectWallet("another-wallet");
+    return recoveryFixture();
+  } });
+  await assert.rejects(client.getRecoveryStatus(), { code: "WALLET_CHANGED" });
 });

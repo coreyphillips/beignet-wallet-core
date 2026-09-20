@@ -561,6 +561,12 @@ function publicOffer(offer) {
 const requires = (condition, message, code) => {
   if (!condition) throw new WalletError(message, code);
 };
+const validateReceiveMode = (mode) =>
+  requires(
+    mode === undefined || mode === "unified" || mode === "offline",
+    "Choose a supported receive mode.",
+    "INVALID_PARAMS",
+  );
 const knownRefusal = (error) =>
   error instanceof WalletError &&
   ([401, 403, 404].includes(error.status) ||
@@ -710,12 +716,58 @@ export class WalletClient {
     );
     return result.mnemonic;
   }
+  async getRecoveryStatus() {
+    const epoch = this._epoch;
+    const result = await this._get("/recovery/status");
+    this._assertEpoch(epoch);
+    const phases = ["idle", "settling", "applying", "applied", "refused"];
+    const states = ["disabled", "running", "restore-required", "restoring", "restart-required", "fenced"];
+    requires(
+      ["off", "peer-storage", "async-remote", "quorum"].includes(result?.mode) &&
+        states.includes(result?.state) &&
+        typeof result?.autoApply?.enabled === "boolean" &&
+        phases.includes(result?.autoApply?.phase) &&
+        (result.node == null || Array.isArray(result.node.channels)),
+      "The wallet returned an incomplete recovery status.",
+      "INVALID_RESPONSE",
+    );
+    return {
+      mode: result.mode,
+      state: result.state,
+      importPending: result.importPending === true,
+      importComplete: result.importComplete === true,
+      autoApply: {
+        enabled: result.autoApply.enabled,
+        phase: result.autoApply.phase,
+        lastReason: typeof result.autoApply.lastReason === "string"
+          ? result.autoApply.lastReason.slice(0, 512) : null,
+      },
+      capsuleCount: integerField(result.capsules?.candidates ?? 0, "recovery backup count"),
+      backupChannelCount: result.capsules?.best == null ? null
+        : integerField(result.capsules.best.channelCount, "backup channel count"),
+      channels: (result.node?.channels ?? []).map((channel) => {
+        requires(
+          typeof channel?.channelId === "string" && /^[a-f0-9]{64}$/i.test(channel.channelId) &&
+            typeof channel.status === "string" && channel.status.length <= 80,
+          "The wallet returned an invalid recovered channel.",
+          "INVALID_RESPONSE",
+        );
+        return {
+          channelId: channel.channelId,
+          status: channel.status,
+          restoreRecencyUnproven: channel.restoreRecencyUnproven === true,
+          fundingUnidentified: channel.fundingUnidentified === true,
+        };
+      }),
+    };
+  }
   async createWallet({
     name,
     network = "mainnet",
     primaryUri,
     electrum,
     mnemonic,
+    recoveryAutoApply,
   } = {}) {
     requires(
       ["mainnet", "testnet", "regtest"].includes(network),
@@ -730,10 +782,22 @@ export class WalletClient {
         ? mnemonic.trim().toLowerCase().split(/\s+/).filter(Boolean)
         : [];
     requires(
-      phrase.length === 0 || [12, 15, 18, 21, 24].includes(phrase.length),
-      "A recovery phrase has 12 or 24 words.",
+      mnemonic === undefined || (typeof mnemonic === "string" && [12, 15, 18, 21, 24].includes(phrase.length)),
+      "Enter a valid recovery phrase of 12 to 24 words.",
       "INVALID_MNEMONIC",
     );
+    requires(
+      recoveryAutoApply === undefined || typeof recoveryAutoApply === "boolean",
+      "Choose whether to recover channel backups.",
+      "INVALID_PARAMS",
+    );
+    if (recoveryAutoApply === true) {
+      requires(phrase.length > 0, "Enter the existing wallet's recovery phrase.", "INVALID_MNEMONIC");
+      requires(this.embedded, "Channel recovery import is only available for this browser wallet.", "RECOVERY_UNAVAILABLE");
+      const config = await this.getConfig();
+      requires(config?.recoveryAutoApplyAvailable === true,
+        "Reopen the wallet to load the version that supports channel recovery import.", "RECOVERY_UNAVAILABLE");
+    }
     const uri = validatePrimaryUri(
       primaryUri || (network === "mainnet" ? DEFAULT_PRIMARY_URI : ""),
     );
@@ -742,6 +806,7 @@ export class WalletClient {
       network,
       ...(electrum ? { electrum } : {}),
       ...(phrase.length ? { mnemonic: phrase.join(" ") } : {}),
+      ...(recoveryAutoApply === true ? { recoveryAutoApply: true } : {}),
       recoveryMode: "peer-storage",
       tor: uri.includes(".onion:"),
       lfbw: {
@@ -1620,7 +1685,8 @@ export class WalletClient {
       ...(result.txid ? { txid: result.txid } : {}),
     });
   }
-  async quoteReceive({ amountSats, description } = {}) {
+  async quoteReceive({ amountSats, description, mode } = {}) {
+    validateReceiveMode(mode);
     const epoch = this._epoch;
     const amount = amountOptional(amountSats);
     const rec = await this._record();
@@ -1641,8 +1707,22 @@ export class WalletClient {
       primaryConnected: connected,
     });
     let offlineQuote;
-    const config = this.embedded ? await this.getConfig() : {};
-    if (config.offlineReceiveAvailable) {
+    // Receiving offline is an opt-in, never the default, on every surface
+    // (umbrel 0.23.1 made the same change). The default plan is a plain
+    // invoice over existing inbound capacity, or a JIT invoice when the
+    // primary has to provide the capacity: it funds on the first payment and
+    // takes its fee then. The embedded client used to prefer the offline lane
+    // whenever the engine advertised it, which asked the primary to fund a
+    // channel ahead of any payment (a fee-free open a primary is never meant
+    // to give) and failed every receive against a primary that offers no
+    // offline settlement.
+    if (mode === "offline") {
+      const config = await this.getConfig();
+      requires(
+        config.offlineReceiveAvailable === true,
+        "This wallet does not support offline receiving.",
+        "RECEIVE_UNAVAILABLE",
+      );
       requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
       offlineQuote = await this._get(`/receive/quote?amountSats=${amount}`);
       requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
@@ -2453,13 +2533,22 @@ export class DemoWalletClient {
       "DEMO_ONLY",
     );
   }
+  async getRecoveryStatus() {
+    return {
+      mode: "off", state: "disabled", importPending: false, importComplete: false,
+      autoApply: { enabled: false, phase: "idle", lastReason: null },
+      capsuleCount: 0, backupChannelCount: null, channels: [],
+    };
+  }
   async listWallets() {
     return [clone(this.wallet)];
   }
   selectWallet(id) {
     requires(id === this.wallet.id, "Choose the preview wallet.", "NO_WALLET");
   }
-  async createWallet({ name, network = "mainnet", primaryUri } = {}) {
+  async createWallet({ name, network = "mainnet", primaryUri, mnemonic, recoveryAutoApply } = {}) {
+    requires(mnemonic === undefined && recoveryAutoApply !== true,
+      "Recovery phrases cannot be imported into a preview wallet.", "DEMO_ONLY");
     this.wallet = {
       ...this.wallet,
       name: boundedDescription(name) || "My wallet",
@@ -2576,7 +2665,13 @@ export class DemoWalletClient {
           : "Preview payment is confirming. No real money moved.",
     };
   }
-  async quoteReceive({ amountSats, description } = {}) {
+  async quoteReceive({ amountSats, description, mode } = {}) {
+    validateReceiveMode(mode);
+    requires(
+      mode !== "offline",
+      "This wallet does not support offline receiving.",
+      "RECEIVE_UNAVAILABLE",
+    );
     const amount = amountOptional(amountSats);
     const quote = {
       id: uid(),
