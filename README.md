@@ -1,6 +1,6 @@
 # Beignet wallet core
 
-Dependency-free ES modules shared by the native and web apps. In host mode, the host holds keys and runs Beignet. In embedded mode, the local portable engine owns keys and runs inside the device or browser worker. This package supplies the same wallet interface for both modes; it never changes an embedded request into a host request. See [CONTRACT.md](CONTRACT.md) for the UI contract.
+Dependency-free ES modules shared by the native and web apps (the package is `private`; Chicory and the web app pin it by git commit, `github:coreyphillips/beignet-wallet-core#<commit>`, not by an npm name). In host mode, the host holds keys and runs Beignet. In embedded mode, the local portable engine owns keys and runs inside the device or browser worker. This package supplies the same wallet interface for both modes; it never changes an embedded request into a host request. See [CONTRACT.md](CONTRACT.md) for the UI contract.
 
 ```js
 import { WalletClient } from '@beignet/wallet-core';
