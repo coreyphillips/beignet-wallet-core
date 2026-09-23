@@ -1333,6 +1333,37 @@ export class WalletClient {
         "This payment was already submitted. Check Activity before sending again.",
         "ALREADY_SUBMITTED",
       );
+      // What the channel can send, read before asking for a route: with no
+      // room the router finds none, and the estimate's refusal used to hide
+      // the reason. A channel whose primary is away sends nothing, and that is
+      // not a low balance, so it is said first.
+      const [liquidity, peers] = await Promise.all([
+        this._get("/liquidity"),
+        this._get("/peers"),
+      ]);
+      const sendable = integerField(liquidity.sendableSats, "available balance");
+      const refuseShortfall = async (needed) => {
+        const primary = rec.lfbw?.primaryPubkey;
+        requires(
+          !primary ||
+            (Array.isArray(peers) &&
+              peers.some(
+                (p) =>
+                  p.pubkey === primary &&
+                  (p.connected || p.state === "connected" || p.state === "ready"),
+              )),
+          "Your primary node needs to reconnect before this wallet can send over Lightning. It retries by itself, so try again in a minute.",
+          "PRIMARY_DOWN",
+        );
+        const arriving = await this._arrivingFunds(needed, rec);
+        requires(
+          false,
+          arriving ||
+            `You can send up to ${formatSats(sendable)} sats over Lightning right now, which is not enough for this payment and its fee.`,
+          "INSUFFICIENT_FUNDS",
+        );
+      };
+      if (amount > sendable) await refuseShortfall(amount);
       const estimate = await this._post(
         "/payment/estimate",
         {
@@ -1342,21 +1373,7 @@ export class WalletClient {
         true,
       );
       feeSats = integerField(estimate.estimatedFeeSats, "payment fee");
-      const liquidity = await this._get("/liquidity");
-      if (
-        !(
-          amount + feeSats <=
-          integerField(liquidity.sendableSats, "available balance")
-        )
-      ) {
-        const arriving = await this._arrivingFunds(amount + feeSats, rec);
-        requires(
-          false,
-          arriving ||
-            "Some funds may still be arriving, or the available balance is too low for this payment and its fee.",
-          "INSUFFICIENT_FUNDS",
-        );
-      }
+      if (!(amount + feeSats <= sendable)) await refuseShortfall(amount + feeSats);
       if (estimate.warning) warnings.push(estimate.warning);
       destination = target.invoice;
       description = text(decoded.description) || description;
