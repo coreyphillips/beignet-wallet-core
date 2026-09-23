@@ -958,6 +958,7 @@ export class WalletClient {
       transactions,
       submissions,
       savedRequests,
+      offline,
     ] = await Promise.all([
       this._record(),
       this._get("/info"),
@@ -971,6 +972,9 @@ export class WalletClient {
       this._get("/transactions"),
       this._request(this._managerWalletPath("/activity")),
       this._get("/receive/requests").catch(() => null),
+      // The device engine says how much an offline receive can take; a
+      // host's daemon has no such route, and there the figure stays unknown.
+      this._get("/receive/offline").catch(() => null),
     ]);
     this._assertEpoch(epoch);
     for (const value of [
@@ -1170,6 +1174,9 @@ export class WalletClient {
         availableSats: integerField(status.canSend, "available balance"),
         pendingSats: integerField(pendingSats, "pending balance"),
         receivableSats: integerField(status.canReceive, "receivable balance"),
+        ...(Number.isSafeInteger(offline?.maxSats) && offline.maxSats >= 0
+          ? { offlineReceivableSats: offline.maxSats }
+          : {}),
       },
       activity: [...activity, ...local].sort(
         (a, b) => b.timestamp - a.timestamp,
@@ -1726,6 +1733,14 @@ export class WalletClient {
       requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
       offlineQuote = await this._get(`/receive/quote?amountSats=${amount}`);
       requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
+      // A host's daemon answers an amount no channel can hold offline with a
+      // direct-funding plan (beignet #925), which would fail verification
+      // after the review. Refuse it here instead.
+      requires(
+        offlineQuote.mode !== "direct-funding",
+        "No channel can hold an offline receive right now. It needs a channel with your primary node that holds none of your balance. Turn off Receive offline to create an ordinary payment request.",
+        "RECEIVE_UNAVAILABLE",
+      );
       plan = { kind: "offline" };
     }
     requires(
