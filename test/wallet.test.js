@@ -3264,3 +3264,27 @@ test("recovery progress rejects an answer from a previously selected wallet", as
   } });
   await assert.rejects(client.getRecoveryStatus(), { code: "WALLET_CHANGED" });
 });
+
+test("the snapshot carries how much an offline receive can take only when the engine says", async () => {
+  const { client } = embeddedFixture({ "/receive/offline": { maxSats: 30000 } });
+  assert.equal((await client.snapshot()).balance.offlineReceivableSats, 30000);
+  const { client: none } = embeddedFixture({ "/receive/offline": { maxSats: 0 } });
+  assert.equal((await none.snapshot()).balance.offlineReceivableSats, 0);
+  // A host's daemon has no such route: unknown, not 0.
+  const { client: host } = fixture();
+  assert.equal("offlineReceivableSats" in (await host.snapshot()).balance, false);
+  const { client: odd } = embeddedFixture({ "/receive/offline": { maxSats: -1 } });
+  assert.equal("offlineReceivableSats" in (await odd.snapshot()).balance, false);
+});
+
+test("a host's direct-funding answer to an offline quote is refused before the review", async () => {
+  const { client, calls } = fixture({
+    "/api/config": { offlineReceiveAvailable: true },
+    "/receive/quote": { available: true, mode: "direct-funding", peer: PK, amountSats: 10000, feeSats: 0, minAmountSat: 5000, expiresAt: NOW + 60000 },
+  });
+  await assert.rejects(client.quoteReceive({ amountSats: 10000, mode: "offline" }), {
+    code: "RECEIVE_UNAVAILABLE",
+    message: /No channel can hold an offline receive right now/,
+  });
+  assert.ok(!calls.some((c) => ["/receive/invoice", "/invoice/create", "/jit/invoice"].includes(c.path)));
+});

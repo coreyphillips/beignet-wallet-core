@@ -80,6 +80,11 @@ export interface WalletSnapshot {
     availableSats: number;
     pendingSats: number;
     receivableSats: number;
+    /**
+     * The most an offline receive can take right now, 0 when no channel can
+     * hold one. Absent when the engine does not say (a host's daemon).
+     */
+    offlineReceivableSats?: number;
   };
   activity: Activity[];
   primary: {
