@@ -853,7 +853,7 @@ export class WalletClient {
   async diagnostics() {
     const rec = await this._record();
     const read = (path) => this._get(path).catch(() => null);
-    const [info, health, balance, liquidity, channels, peers, utxos, funding] =
+    const [info, health, balance, liquidity, channels, peers, utxos, funding, graph] =
       await Promise.all([
         read("/info"),
         read("/health"),
@@ -863,6 +863,7 @@ export class WalletClient {
         read("/peers"),
         read("/utxos"),
         read("/direct-funding/config"),
+        read("/graph/info"),
       ]);
     const primaryPubkey = rec.lfbw?.primaryPubkey || null;
     const wallet = publicWallet(rec);
@@ -891,6 +892,16 @@ export class WalletClient {
       sendableSats: Number.isFinite(liquidity?.sendableSats)
         ? liquidity.sendableSats
         : null,
+      // The network map routes are found on. A device with a handful of
+      // channels here cannot route past its primary.
+      graph:
+        graph && Number.isFinite(graph.channelCount)
+          ? {
+              nodes: Number(graph.nodeCount) || 0,
+              channels: graph.channelCount,
+              lastSyncAt: Number.isFinite(graph.lastSyncAt) ? graph.lastSyncAt : null,
+            }
+          : null,
       utxos: Array.isArray(utxos)
         ? utxos.map((u) => ({
             valueSats: Number(u.valueSats) || 0,

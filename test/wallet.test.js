@@ -2918,6 +2918,7 @@ test("diagnostics gather the engine's figures in one read and never carry secret
   const { client } = fixture({
     "/info": { blockHeight: 800123, pendingCloseBalanceSats: 0, erroredBalanceSats: 0 },
     "/health": { electrumConnected: true },
+    "/graph/info": { nodeCount: 5244, channelCount: 27537, lastSyncAt: 1790000000000 },
     "/direct-funding/config": {
       lspPubkey: PK,
       lspHost: "relay.example",
@@ -2937,10 +2938,12 @@ test("diagnostics gather the engine's figures in one read and never carry secret
   assert.equal(d.channels[0].state, "NORMAL");
   assert.equal(d.directFunding.allowUnpairedSplice, true);
   assert.equal(d.utxos[0].valueSats, 2000);
+  assert.deepEqual(d.graph, { nodes: 5244, channels: 27537, lastSyncAt: 1790000000000 });
   assert.equal(JSON.stringify(d).includes("fixture-word"), false);
   // A read that fails leaves its field null rather than failing the whole picture.
   const { client: partial } = fixture({ "/direct-funding/config": new Error("no") });
   assert.equal((await partial.diagnostics()).directFunding, null);
+  assert.equal((await partial.diagnostics()).graph, null, "an engine without /graph/info");
   assert.deepEqual(Object.keys(await new DemoWalletClient().diagnostics()).sort(), ["checkedAt", "demo"]);
 });
 
