@@ -23,6 +23,15 @@ export {
 } from "./payment-uri.js";
 
 export const DEFAULT_HOST_URL = "http://127.0.0.1:8787";
+/**
+ * Routing fee a Lightning send may pay above the estimate. The engine reports
+ * the estimate rounded DOWN to whole sats and enforces the cap in millisats,
+ * so a cap equal to the estimate refused the very route it priced (a 1,024
+ * msat fee against a 1,000 msat cap: "Route fee exceeds maximum"). The rest
+ * leaves room for a retry over a slightly costlier route when the first
+ * fails. The review shows the resulting maximum.
+ */
+export const LIGHTNING_FEE_HEADROOM_SATS = 10;
 export const DEFAULT_PRIMARY_URI =
   "025501f56b72e7b999443b836ae1bff4c6fff514943d3f6677302a9189949bd99c@ulyeemszaigzrvpjcjcby4ehibrvsuqi5sq4dmmew2urk2nse5f7spid.onion:9102";
 const MAX_SATS = 2_100_000_000_000_000;
@@ -1303,6 +1312,7 @@ export class WalletClient {
     let destination;
     let description = parsed.message || parsed.label || "";
     let feeSats;
+    let estimatedFeeSats;
     let path;
     let body;
     let route;
@@ -1383,8 +1393,12 @@ export class WalletClient {
         },
         true,
       );
-      feeSats = integerField(estimate.estimatedFeeSats, "payment fee");
-      if (!(amount + feeSats <= sendable)) await refuseShortfall(amount + feeSats);
+      estimatedFeeSats = integerField(estimate.estimatedFeeSats, "payment fee");
+      if (!(amount + estimatedFeeSats <= sendable))
+        await refuseShortfall(amount + estimatedFeeSats);
+      // The review shows, and the payment is held to, a maximum: the
+      // estimate plus headroom for rounding and a retry.
+      feeSats = estimatedFeeSats + LIGHTNING_FEE_HEADROOM_SATS;
       if (estimate.warning) warnings.push(estimate.warning);
       destination = target.invoice;
       description = text(decoded.description) || description;
@@ -1501,6 +1515,7 @@ export class WalletClient {
       feeSats,
       feeLabel:
         route === "lightning" ? "Maximum routing fee" : "Estimated network fee",
+      ...(estimatedFeeSats != null ? { estimatedFeeSats } : {}),
       totalSats: amount + feeSats,
       route,
       expiresAt,
