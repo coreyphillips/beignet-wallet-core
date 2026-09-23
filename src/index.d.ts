@@ -107,8 +107,12 @@ export interface SendReview {
   destination: string;
   description: string;
   amountSats: number;
+  /** The most this payment can cost in fees; for Lightning, the estimate plus headroom. */
   feeSats: number;
   feeLabel: string;
+  /** Lightning only: the fee of the route that was priced, usually what is paid. */
+  estimatedFeeSats?: number;
+  /** amountSats + feeSats: the most this payment can cost. */
   totalSats: number;
   route: "lightning" | "bitcoin";
   /** Present when a Bitcoin route pays a direct-funding request instead of the address. */
@@ -377,6 +381,8 @@ export class DemoWalletClient implements WalletClientInterface {
 }
 export const DEFAULT_PRIMARY_URI: string;
 export const DEFAULT_HOST_URL: string;
+/** Routing fee a Lightning send may pay above the estimate. */
+export const LIGHTNING_FEE_HEADROOM_SATS: number;
 export function parseSats(input: string | number): number;
 export function formatSats(input: number): string;
 export function validatePrimaryUri(input: string): string;

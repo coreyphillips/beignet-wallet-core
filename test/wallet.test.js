@@ -5,6 +5,7 @@ import {
   EmbeddedWalletClient,
   DemoWalletClient,
   DEFAULT_PRIMARY_URI,
+  LIGHTNING_FEE_HEADROOM_SATS,
   parseSats,
   parsePayment,
   btcStringToSats,
@@ -545,14 +546,17 @@ test("prepare/send picks BIP21 Lightning, caps fee, is single use and no signatu
   });
   assert.equal(review.route, "lightning");
   assert.equal(review.amountSats, 10000);
-  assert.equal(review.totalSats, 10007);
+  // The fixture estimates 7 sats; the review and the cap allow 10 more.
+  assert.equal(review.estimatedFeeSats, 7);
+  assert.equal(review.feeSats, 17);
+  assert.equal(review.totalSats, 10017);
   assert.equal(calls.filter((c) => c.path === "/invoice/pay-safe").length, 0);
   const sent = await client.send(review);
   assert.equal(sent.status, "completed");
   assert.equal(sent.feeSats, 5);
   assert.ok(!JSON.stringify(sent).includes("secret-never-exposed"));
   const payment = calls.find((c) => c.path === "/invoice/pay-safe");
-  assert.deepEqual(payment.body, { bolt11: INVOICE, maxFeeSats: 7 });
+  assert.deepEqual(payment.body, { bolt11: INVOICE, maxFeeSats: 17 });
   assert.equal(payment.headers.Authorization, "Bearer test-token");
   assert.equal(payment.redirect, "error");
   await assert.rejects(client.send(review), { code: "INVALID_REVIEW" });
@@ -3329,4 +3333,23 @@ test("a Lightning send checks what can be sent before asking for a route", async
     code: "NO_ROUTE",
     message: /not in this wallet's map/,
   });
+});
+
+test("the Lightning fee cap never falls below the route the estimate priced", async () => {
+  // The engine floors the estimate to whole sats and enforces the cap in
+  // msat: a 1,024 msat route estimated as 1 sat was refused at a 1,000 msat
+  // cap with "Route fee exceeds maximum". The cap now has headroom.
+  const { client, calls } = embeddedFixture({
+    "/payment/estimate": { estimatedFeeSats: 1 },
+  });
+  const review = await client.prepareSend({ request: INVOICE });
+  assert.equal(review.estimatedFeeSats, 1);
+  assert.equal(review.feeSats, 1 + LIGHTNING_FEE_HEADROOM_SATS);
+  assert.equal(review.feeLabel, "Maximum routing fee");
+  await client.send(review);
+  const payment = calls.find((c) => c.path === "/invoice/pay-safe");
+  assert.ok(payment.body.maxFeeSats * 1000 >= 1024, "the priced route fits under the cap");
+  // Bitcoin sends carry no estimate field: their fee is the network fee.
+  const onchain = await embeddedFixture().client.prepareSend({ request: ADDRESS, amountSats: 2000 });
+  assert.equal("estimatedFeeSats" in onchain, false);
 });
