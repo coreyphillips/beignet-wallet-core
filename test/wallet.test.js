@@ -3288,3 +3288,42 @@ test("a host's direct-funding answer to an offline quote is refused before the r
   });
   assert.ok(!calls.some((c) => ["/receive/invoice", "/invoice/create", "/jit/invoice"].includes(c.path)));
 });
+
+test("a Lightning send checks what can be sent before asking for a route", async () => {
+  // A primary that is away leaves the channel unable to send, which is not a
+  // low balance and must not read as one.
+  const { client: away, calls: awayCalls } = embeddedFixture({
+    "/liquidity": { sendableSats: 0 },
+    "/peers": [],
+  });
+  await assert.rejects(away.prepareSend({ request: INVOICE }), {
+    code: "PRIMARY_DOWN",
+    message: /primary node needs to reconnect/,
+  });
+  assert.ok(!awayCalls.some((c) => c.path === "/payment/estimate"));
+  // Connected but short: the balance refusal, before any estimate.
+  const { client: short, calls: shortCalls } = embeddedFixture({
+    "/liquidity": { sendableSats: 5000 },
+  });
+  await assert.rejects(short.prepareSend({ request: INVOICE }), {
+    code: "INSUFFICIENT_FUNDS",
+  });
+  assert.ok(!shortCalls.some((c) => c.path === "/payment/estimate"));
+  // Enough for the amount but not the fee: refused after the estimate.
+  const { client: fee } = embeddedFixture({
+    "/liquidity": { sendableSats: 10003 },
+  });
+  await assert.rejects(fee.prepareSend({ request: INVOICE }), {
+    code: "INSUFFICIENT_FUNDS",
+  });
+  // The engine's own reason for a missing route reaches the caller unchanged.
+  const reason = Object.assign(
+    new Error("No route found. The recipient is not in this wallet's map of the Lightning network."),
+    { code: "NO_ROUTE" },
+  );
+  const { client: noRoute } = embeddedFixture({ "/payment/estimate": reason });
+  await assert.rejects(noRoute.prepareSend({ request: INVOICE }), {
+    code: "NO_ROUTE",
+    message: /not in this wallet's map/,
+  });
+});
