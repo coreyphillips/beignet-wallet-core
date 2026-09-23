@@ -260,6 +260,8 @@ export interface WalletDiagnostics {
   primaryConnected?: boolean | null;
   balance?: { onchain: number; lightning: number; splicingSats: number } | null;
   sendableSats?: number | null;
+  /** The network map routes are found on (GET /graph/info). */
+  graph?: { nodes: number; channels: number; lastSyncAt: number | null } | null;
   utxos?: { valueSats: number; height: number }[] | null;
   channels?:
     | {
