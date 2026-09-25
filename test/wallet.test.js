@@ -2449,13 +2449,14 @@ test("a Bitcoin send is refused while the channel's own funding is unconfirmed",
 test("a payment within the total but above what can be sent explains what is arriving", async () => {
   // The fixture holds 202,500 sats in total (200,000 Lightning, 2,000 arriving
   // on-chain, 500 in a splice) but can only send 180,000 out to an address.
-  // "Not enough funds" would be wrong: the money is there, it is just moving.
+  // For a payment 2,000 over that, "Not enough funds" would be wrong: the
+  // money is there, it is just moving.
   const { client } = embeddedFixture();
   await assert.rejects(
-    client.prepareSend({ request: ADDRESS, amountSats: 195000 }),
+    client.prepareSend({ request: ADDRESS, amountSats: 182000 }),
     (error) => {
       assert.equal(error.code, "INSUFFICIENT_FUNDS");
-      assert.match(error.message, /15,000 sats more than you can send/);
+      assert.match(error.message, /2,000 sats more than you can send/);
       assert.match(error.message, /2,000 sats arriving on-chain/);
       assert.match(error.message, /500 sats rejoin your balance/);
       assert.match(error.message, /request stays here to try again/);
@@ -2471,6 +2472,37 @@ test("a payment within the total but above what can be sent explains what is arr
       assert.equal(error.code, "INSUFFICIENT_FUNDS");
       assert.match(error.message, /available balance is too low/);
       assert.doesNotMatch(error.message, /arriving on-chain/);
+      return true;
+    },
+  );
+});
+
+test("a shortfall that nothing arriving covers gets the plain refusal", async () => {
+  // Total includes the channel reserve, which is never sendable. With nothing
+  // arriving, a payment inside that gap used to be told "0 sats on their way
+  // into your channel" and that it could try again.
+  const { client } = embeddedFixture({
+    "/balance": { onchain: 0, lightning: 10500, splicingSats: 0 },
+    "/liquidity": { sendableSats: 9500 },
+    "/utxos": [],
+  });
+  await assert.rejects(client.prepareSend({ request: INVOICE }), (error) => {
+    assert.equal(error.code, "INSUFFICIENT_FUNDS");
+    assert.match(error.message, /You can send up to 9,500 sats over Lightning/);
+    assert.doesNotMatch(error.message, /on their way|try again/);
+    return true;
+  });
+
+  // Something is arriving, but less than the payment is short: the reserve
+  // and the splice fee make up the rest, and waiting does not make the
+  // payment possible.
+  const { client: partly } = embeddedFixture();
+  await assert.rejects(
+    partly.prepareSend({ request: ADDRESS, amountSats: 195000 }),
+    (error) => {
+      assert.equal(error.code, "INSUFFICIENT_FUNDS");
+      assert.match(error.message, /available balance is too low/);
+      assert.doesNotMatch(error.message, /arriving on-chain|try again/);
       return true;
     },
   );
@@ -2610,6 +2642,25 @@ test("the arriving-funds note speaks in the wallet's own terms, never the manage
     confirmedOnchain: CHANNELIZE_FLOOR_SATS - 1,
   });
   assert.match(small, new RegExp(CHANNELIZE_FLOOR_SATS.toLocaleString("en-US")));
+});
+
+test("the arriving-funds note only speaks when what is arriving covers the shortfall", () => {
+  // 1,000 sats of the 100,000 total are the channel reserve.
+  const status = {
+    canSend: 99000,
+    total: 100000,
+    unconfirmed: 0,
+    confirmedOnchain: 0,
+    feeWait: null,
+    pending: 0,
+    pendingChannels: [],
+  };
+  assert.equal(arrivingFundsNote(99500, status), null);
+  const arriving = { ...status, total: 100300, unconfirmed: 300, pending: 300 };
+  assert.equal(arrivingFundsNote(99500, arriving), null);
+  const note = arrivingFundsNote(99200, arriving);
+  assert.match(note, /200 sats more than you can send/);
+  assert.match(note, /300 sats arriving on-chain/);
 });
 
 test("an existing recovery phrase is sent once for a restore and checked for shape first", async () => {

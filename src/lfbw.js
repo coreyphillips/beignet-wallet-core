@@ -75,15 +75,21 @@ export function planInvoice({
 }
 
 /**
- * What to say when a payment is larger than Can send but not larger than
- * Total: the difference is arriving, and the figures say how (umbrel #89).
- * Null when the amount is payable now or exceeds Total, which stays the
- * plain refusal. `status` is lfbwStatus().
+ * What to say when a payment is larger than Can send and the funds arriving
+ * cover the difference: the figures say what is arriving and how (umbrel
+ * #89). Null when the amount is payable now, exceeds Total, or is short by
+ * more than is arriving, which stays the plain refusal. `status` is
+ * lfbwStatus().
  */
 export function arrivingFundsNote(amountSats, status) {
 	if (!status || !(amountSats > 0)) return null;
 	if (amountSats <= status.canSend || amountSats > status.total) return null;
 	const short = amountSats - status.canSend;
+	// Total also holds the channel reserve (and, for a send to an address, the
+	// splice fee), which never becomes sendable. A shortfall within Total can
+	// then have little or nothing arriving to make it up, and a note saying
+	// the request can try again would promise sats that are not coming.
+	if (!(status.pending >= short)) return null;
 	const parts = [];
 	if (status.unconfirmed > 0) {
 		parts.push(`${fmt(status.unconfirmed)} sats arriving on-chain, about two blocks away`);
@@ -107,8 +113,7 @@ export function arrivingFundsNote(amountSats, status) {
 	if (splicing > 0) {
 		parts.push(`${fmt(splicing)} sats rejoin your balance when the splice locks`);
 	}
-	const arriving = parts.length > 0 ? parts.join('; ') : `${fmt(status.pending)} sats on their way into your channel`;
-	return `This is ${fmt(short)} sats more than you can send right now. ${arriving}. The request stays here to try again.`;
+	return `This is ${fmt(short)} sats more than you can send right now. ${parts.join('; ')}. The request stays here to try again.`;
 }
 
 /**
