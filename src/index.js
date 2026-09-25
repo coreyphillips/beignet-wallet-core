@@ -318,9 +318,29 @@ export function mergeActivity(
   now = Date.now(),
 ) {
   const rows = new Map();
-  const fundingTxids = new Set(
-    channels.map((channel) => channel.fundingTxid).filter(Boolean),
-  );
+  // The transactions that fund this wallet's own channels. A splice moves a
+  // channel onto a new funding transaction, so the current funding alone
+  // loses the open once a deposit is spliced in, and does not name a splice
+  // that is still locking. The engine reports those two where it can
+  // (beignet-portable-engine #16). A transaction still locking into its
+  // channel stays pending even once it has a confirmation.
+  const fundingTxids = new Set();
+  const lockingTxids = new Set();
+  for (const channel of channels) {
+    const { fundingTxid, pendingSpliceTxid, previousFundingTxids } = channel;
+    if (typeof fundingTxid === "string" && fundingTxid) {
+      fundingTxids.add(fundingTxid);
+      if (FUNDING_SETUP_STATES.has(channel.state))
+        lockingTxids.add(fundingTxid);
+    }
+    if (typeof pendingSpliceTxid === "string" && pendingSpliceTxid) {
+      fundingTxids.add(pendingSpliceTxid);
+      lockingTxids.add(pendingSpliceTxid);
+    }
+    if (Array.isArray(previousFundingTxids))
+      for (const txid of previousFundingTxids)
+        if (typeof txid === "string" && txid) fundingTxids.add(txid);
+  }
   const explicitSends = new Set(sentTxids);
   for (const p of payments) {
     if (!p.paymentHash) continue;
@@ -410,15 +430,7 @@ export function mergeActivity(
       feeKnown: tx.feeSats != null,
       feeEstimated: false,
       status:
-        tx.confirmed &&
-        !(
-          internal &&
-          channels.some(
-            (channel) =>
-              channel.fundingTxid === tx.txid &&
-              FUNDING_SETUP_STATES.has(channel.state),
-          )
-        )
+        tx.confirmed && !(internal && lockingTxids.has(tx.txid))
           ? "completed"
           : "pending",
       timestamp: asTime(tx.confirmTimestamp || tx.timestamp),

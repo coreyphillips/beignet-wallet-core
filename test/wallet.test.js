@@ -2039,6 +2039,155 @@ test("funding transfer history follows channel readiness without regressing comp
   }
 });
 
+test("moving the wallet's own coins into its channel stays a transfer through a splice", () => {
+  // The device review: a 70,000 sat open, then a 30,000 sat deposit spliced
+  // in. The splice read as sent while it locked, and once it locked the open
+  // turned into a 70,000 sat send.
+  const open = "70".repeat(32);
+  const splice = "30".repeat(32);
+  const payment = "d1".repeat(32);
+  const transactions = (spliceConfirmed) => [
+    {
+      txid: open,
+      type: "sent",
+      valueSats: -70000,
+      feeSats: 765,
+      confirmed: true,
+      timestamp: NOW - 3600000,
+    },
+    {
+      txid: splice,
+      type: "sent",
+      valueSats: -30000,
+      feeSats: 280,
+      confirmed: spliceConfirmed,
+      timestamp: NOW,
+    },
+    // A direct funding this wallet paid into someone else's channel.
+    {
+      txid: payment,
+      type: "sent",
+      valueSats: -12000,
+      feeSats: 300,
+      confirmed: true,
+      timestamp: NOW - 60000,
+    },
+  ];
+  const byId = (rows) =>
+    Object.fromEntries(rows.map((row) => [row.txid, row]));
+  for (const spliceConfirmed of [false, true]) {
+    const locking = byId(
+      mergeActivity({
+        channels: [
+          {
+            ...channel,
+            state: "SPLICING",
+            fundingTxid: open,
+            pendingSpliceTxid: splice,
+            pendingSpliceLocalBalanceSats: 99000,
+            payThroughSplice: true,
+          },
+        ],
+        transactions: transactions(spliceConfirmed),
+      }),
+    );
+    assert.equal(locking[open].kind, "transfer");
+    assert.equal(locking[open].status, "completed");
+    assert.equal(locking[splice].kind, "transfer");
+    assert.equal(locking[splice].title, "Wallet transfer");
+    assert.equal(locking[splice].amountSats, 30000);
+    assert.equal(locking[splice].status, "pending", "locking splice");
+    assert.equal(locking[payment].kind, "sent");
+  }
+  const locked = byId(
+    mergeActivity({
+      channels: [
+        {
+          ...channel,
+          state: "NORMAL",
+          fundingTxid: splice,
+          previousFundingTxids: [open],
+        },
+      ],
+      transactions: transactions(true),
+    }),
+  );
+  for (const [txid, amountSats] of [
+    [open, 70000],
+    [splice, 30000],
+  ]) {
+    assert.equal(locked[txid].kind, "transfer");
+    assert.equal(locked[txid].amountSats, amountSats);
+    assert.equal(locked[txid].status, "completed");
+  }
+  assert.equal(locked[payment].kind, "sent");
+  // An explicit send is still a send, even into a funding transaction.
+  const explicit = byId(
+    mergeActivity({
+      channels: [
+        { ...channel, fundingTxid: splice, previousFundingTxids: [open] },
+      ],
+      transactions: transactions(true),
+      sentTxids: [open],
+    }),
+  );
+  assert.equal(explicit[open].kind, "sent");
+  // Malformed history is ignored rather than trusted.
+  const malformed = byId(
+    mergeActivity({
+      channels: [
+        {
+          ...channel,
+          fundingTxid: splice,
+          pendingSpliceTxid: 7,
+          previousFundingTxids: open,
+        },
+      ],
+      transactions: transactions(true),
+    }),
+  );
+  assert.equal(malformed[open].kind, "sent");
+  assert.equal(malformed[splice].kind, "transfer");
+});
+
+test("a snapshot shows a spliced channel's earlier funding as a transfer", async () => {
+  const open = "70".repeat(32);
+  const splice = "30".repeat(32);
+  const { client } = fixture({
+    "/channels": [
+      { ...channel, fundingTxid: splice, previousFundingTxids: [open] },
+    ],
+    "/transactions": [
+      {
+        txid: open,
+        type: "sent",
+        valueSats: -70000,
+        feeSats: 765,
+        confirmed: true,
+        timestamp: NOW - 3600000,
+      },
+      {
+        txid: splice,
+        type: "sent",
+        valueSats: -30000,
+        feeSats: 280,
+        confirmed: true,
+        timestamp: NOW,
+      },
+    ],
+  });
+  const { activity } = await client.snapshot();
+  assert.deepEqual(
+    activity
+      .filter((row) => row.txid)
+      .map((row) => [row.txid, row.kind, row.amountSats]),
+    [
+      [splice, "transfer", 30000],
+      [open, "transfer", 70000],
+    ],
+  );
+});
+
 test("a reused registered address invalidates cached Bitcoin attribution while Lightning remains exact", async () => {
   const issued = fixture();
   const original = await issued.client.receive(
