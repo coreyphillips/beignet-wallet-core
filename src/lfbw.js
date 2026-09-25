@@ -139,8 +139,19 @@ export function channelizeNote(status, now = Date.now()) {
 			? `${n} sats confirmed. Moving them failed.${why} Retrying.`
 			: `${n} sats confirmed. Moving them failed.${why} Refresh to try again.`;
 	}
-	if (last && last.action === 'wait' && (last.reason === 'splicing' || last.reason === 'channel-pending')) {
+	const waiting = last && last.action === 'wait' ? last.reason : null;
+	if (waiting === 'splicing' || waiting === 'channel-pending') {
 		return `${n} sats confirmed. They move once the current transfer confirms.`;
+	}
+	// Nothing moves while any deposit is unconfirmed, since its sender can
+	// still replace it. With none left unconfirmed the wait is over.
+	if (waiting === 'unconfirmed' && status.unconfirmed > 0) {
+		return `${n} sats confirmed. They move once the arriving sats confirm.`;
+	}
+	// At the current network fee, what would be left is under what a move
+	// carries. Unlike the fee wait, the owner cannot force this one.
+	if (waiting === 'quote-too-small') {
+		return `${n} sats confirmed. Waiting for a lower network fee.`;
 	}
 	return `${n} sats confirmed. Moving them now.`;
 }
@@ -187,7 +198,7 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 		if (unconfirmed > 0) {
 			notes.push(`${fmt(unconfirmed)} sats arriving. Available after confirmation.`);
 		}
-		const moving = channelizeNote({ confirmedOnchain, feeWait, lastChannelize: last });
+		const moving = channelizeNote({ confirmedOnchain, unconfirmed, feeWait, lastChannelize: last });
 		if (moving) notes.push(moving);
 		if (openingSats > 0) {
 			notes.push(`${fmt(openingSats)} sats in a transfer still confirming.`);

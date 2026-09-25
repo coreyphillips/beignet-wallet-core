@@ -13,7 +13,11 @@ import {
   mergeActivity,
 } from "../src/index.js";
 import { bech32Encode, convertBits } from "../src/payment-uri.js";
-import { arrivingFundsNote, CHANNELIZE_FLOOR_SATS } from "../src/lfbw.js";
+import {
+  arrivingFundsNote,
+  lfbwStatus,
+  CHANNELIZE_FLOOR_SATS,
+} from "../src/lfbw.js";
 import {
   base64urlDecode,
   base64urlEncode,
@@ -2967,6 +2971,64 @@ test("confirmed on-chain funds say what the wallet is doing with them", async ()
   }));
   note = (await client.snapshot()).notes.find((n) => n.startsWith("20,000 sats confirmed"));
   assert.match(note, /move at 25,000 sats/);
+});
+
+test("a wait on confirmed funds is never described as a move", async () => {
+  const withLfbw = (extra) => ({ ...record, lfbw: { ...record.lfbw, ...extra } });
+  const wait = (reason) =>
+    withLfbw({ lastChannelize: { action: "wait", reason, at: NOW - 1000 } });
+  // A deposit still unconfirmed holds every move back.
+  let { client } = fixture({
+    "/balance": { onchain: 32000, lightning: 200000, splicingSats: 0 },
+    "/utxos": [
+      { height: 800000, valueSats: 30000 },
+      { height: 0, valueSats: 2000 },
+    ],
+    "/api/wallets/wallet-1": wait("unconfirmed"),
+  });
+  let notes = (await client.snapshot()).notes;
+  let note = notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /once the arriving sats confirm/);
+  assert.ok(!notes.some((n) => /Moving them now/.test(n)), notes.join(" | "));
+  // The page's own figures read the decision the same way.
+  const page = lfbwStatus({
+    rec: wait("unconfirmed"),
+    balance: { onchain: 32000, lightning: 200000, splicingSats: 0 },
+    channels: [channel],
+    utxos: [
+      { height: 800000, valueSats: 30000 },
+      { height: 0, valueSats: 2000 },
+    ],
+  });
+  assert.ok(
+    page.notes.includes("30,000 sats confirmed. They move once the arriving sats confirm."),
+    page.notes.join(" | "),
+  );
+  // Once that deposit has confirmed, the wait is over.
+  const confirmed = {
+    "/balance": { onchain: 30000, lightning: 200000, splicingSats: 0 },
+    "/utxos": [{ height: 800000, valueSats: 30000 }],
+  };
+  ({ client } = fixture({ ...confirmed, "/api/wallets/wallet-1": wait("unconfirmed") }));
+  note = (await client.snapshot()).notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /Moving them now/);
+  // The fee leaves too little to move: nothing moves until it drops.
+  ({ client } = fixture({ ...confirmed, "/api/wallets/wallet-1": wait("quote-too-small") }));
+  note = (await client.snapshot()).notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /Waiting for a lower network fee/);
+  // Once the money has moved, a decision left on the record says nothing.
+  for (const lastChannelize of [
+    { action: "wait", reason: "quote-too-small", at: NOW - 1000 },
+    { action: "splice-in", amountSats: 28000, at: NOW - 1000 },
+  ]) {
+    ({ client } = fixture({
+      "/balance": { onchain: 0, lightning: 228000, splicingSats: 0 },
+      "/utxos": [],
+      "/api/wallets/wallet-1": withLfbw({ lastChannelize }),
+    }));
+    notes = (await client.snapshot()).notes;
+    assert.ok(!notes.some((n) => /sats confirmed/.test(n)), notes.join(" | "));
+  }
 });
 
 test("diagnostics gather the engine's figures in one read and never carry secrets", async () => {
