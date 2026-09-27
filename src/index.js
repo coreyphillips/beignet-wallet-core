@@ -1068,6 +1068,23 @@ export class WalletClient {
       erroredSats;
     const pendingSats =
       balance.onchain + openingSats + splicingSats + closingSats + erroredSats;
+    // What the pending figure is made of, so an app can tell money coming
+    // back from a closed channel apart from deposits waiting to move into
+    // one (wallet-core #17). The on-chain split is clamped so the six parts
+    // always sum to pendingSats, even if a UTXO read disagrees with the
+    // balance read.
+    const unconfirmedSats = Math.min(
+      balance.onchain,
+      integerField(status.unconfirmed, "unconfirmed balance"),
+    );
+    const pending = {
+      unconfirmedSats,
+      confirmedSats: balance.onchain - unconfirmedSats,
+      openingSats,
+      splicingSats,
+      closingSats,
+      erroredSats,
+    };
     const notes = [];
     if (rec.lfbw.setup !== "ready")
       notes.push("Wallet setup is not finished. Check Settings.");
@@ -1205,6 +1222,7 @@ export class WalletClient {
         totalSats: integerField(totalSats, "total balance"),
         availableSats: integerField(status.canSend, "available balance"),
         pendingSats: integerField(pendingSats, "pending balance"),
+        pending,
         receivableSats: integerField(status.canReceive, "receivable balance"),
         ...(Number.isSafeInteger(offline?.maxSats) && offline.maxSats >= 0
           ? { offlineReceivableSats: offline.maxSats }
@@ -2638,6 +2656,14 @@ export class DemoWalletClient {
         totalSats: this._balance + 50000,
         availableSats: this._balance,
         pendingSats: 50000,
+        pending: {
+          unconfirmedSats: 0,
+          confirmedSats: 50000,
+          openingSats: 0,
+          splicingSats: 0,
+          closingSats: 0,
+          erroredSats: 0,
+        },
         receivableSats: 715350,
       },
       activity: clone(this._activity),

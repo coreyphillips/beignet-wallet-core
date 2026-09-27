@@ -79,6 +79,23 @@ export interface WalletSnapshot {
     totalSats: number;
     availableSats: number;
     pendingSats: number;
+    /**
+     * What `pendingSats` is made of. The six parts always sum to it.
+     */
+    pending: {
+      /** Unconfirmed deposits. */
+      unconfirmedSats: number;
+      /** Confirmed on-chain funds not yet in a channel. */
+      confirmedSats: number;
+      /** Funding a channel that is still opening. */
+      openingSats: number;
+      /** Moving into the channel through a splice. */
+      splicingSats: number;
+      /** Coming back from a channel that is closing. */
+      closingSats: number;
+      /** Held up and needing recovery attention. */
+      erroredSats: number;
+    };
     receivableSats: number;
     /**
      * The most an offline receive can take right now, 0 when no channel can

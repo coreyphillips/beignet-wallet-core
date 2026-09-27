@@ -1120,6 +1120,14 @@ test("canonical balances count disconnected, restore-held and parked-splice fund
   assert.equal(snapshot.balance.totalSats, 50000);
   assert.equal(snapshot.balance.availableSats, 0);
   assert.equal(snapshot.balance.pendingSats, 20000);
+  assert.deepEqual(snapshot.balance.pending, {
+    unconfirmedSats: 2000,
+    confirmedSats: 0,
+    openingSats: 3000,
+    splicingSats: 4000,
+    closingSats: 5000,
+    erroredSats: 6000,
+  });
   assert.ok(snapshot.notes.some((note) => note.includes("recovery attention")));
   assert.ok(
     snapshot.notes.every(
@@ -2016,6 +2024,73 @@ test("linking an original URI checks the selected hash and wallet-issued invoice
     code: "REQUEST_NOT_OWNED",
   });
   assert.ok(!other.calls.some((call) => call.path === "/receive/requests"));
+});
+
+test("pending balance says how much is coming back from a closing channel and how much waits on-chain", async () => {
+  // wallet-core #17: the LSP force-closed the only channel. The wallet holds
+  // its share of the close as pending close and a confirmed deposit; an app
+  // must be able to tell the two apart instead of drawing both as deposits
+  // waiting under the channel floor.
+  const { client } = fixture({
+    "/balance": { onchain: 5297, lightning: 0, splicingSats: 0 },
+    "/info": { pendingCloseBalanceSats: 5627, erroredBalanceSats: 0 },
+    "/liquidity": { sendableSats: 0 },
+    "/channels": [],
+    "/peers": [],
+    "/utxos": [{ height: 100, valueSats: 5297 }],
+  });
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.totalSats, 10924);
+  assert.equal(snapshot.balance.availableSats, 0);
+  assert.equal(snapshot.balance.pendingSats, 10924);
+  assert.deepEqual(snapshot.balance.pending, {
+    unconfirmedSats: 0,
+    confirmedSats: 5297,
+    openingSats: 0,
+    splicingSats: 0,
+    closingSats: 5627,
+    erroredSats: 0,
+  });
+  const parts = Object.values(snapshot.balance.pending).reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  assert.equal(parts, snapshot.balance.pendingSats);
+});
+
+test("pending balance made only of confirmed deposits below the floor is all confirmed on-chain", async () => {
+  const { client } = fixture({
+    "/balance": { onchain: 8000, lightning: 0, splicingSats: 0 },
+    "/liquidity": { sendableSats: 0 },
+    "/channels": [],
+    "/peers": [],
+    "/utxos": [
+      { height: 100, valueSats: 3000 },
+      { height: 101, valueSats: 5000 },
+    ],
+  });
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.pendingSats, 8000);
+  assert.deepEqual(snapshot.balance.pending, {
+    unconfirmedSats: 0,
+    confirmedSats: 8000,
+    openingSats: 0,
+    splicingSats: 0,
+    closingSats: 0,
+    erroredSats: 0,
+  });
+  // A UTXO read that disagrees with the balance read never makes the parts
+  // sum to something other than the pending figure.
+  const skewed = fixture({
+    "/balance": { onchain: 1000, lightning: 0, splicingSats: 0 },
+    "/liquidity": { sendableSats: 0 },
+    "/channels": [],
+    "/peers": [],
+    "/utxos": [{ height: 0, valueSats: 1500 }],
+  });
+  const view = await skewed.client.snapshot();
+  assert.equal(view.balance.pending.unconfirmedSats, 1000);
+  assert.equal(view.balance.pending.confirmedSats, 0);
 });
 
 test("receipt lookup failures preserve balances and registered QR metadata without falsely completing requests", async () => {
