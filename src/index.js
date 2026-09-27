@@ -443,6 +443,151 @@ export function mergeActivity(
     (a, b) => b.timestamp - a.timestamp || a.id.localeCompare(b.id),
   );
 }
+/**
+ * The completed-activity ledger (wallet-core #19). A wallet must never show
+ * less than it already knew: an engine that answers a read with fewer rows,
+ * a lookup that fails, or a relaunch must not shorten the history or move a
+ * completed row back to pending, expired or failed. The client keeps every
+ * completed row it has shown, per wallet, and folds each read into it.
+ */
+const ACTIVITY_KINDS = new Set(["sent", "received", "transfer"]);
+const RECEIVE_PHASES = new Set(["waiting", "partial", "pending", "completed"]);
+const boundedText = (value, max) => text(value).slice(0, max);
+const boundedId = (value) =>
+  typeof value === "string" && value && value.length <= 128
+    ? value
+    : undefined;
+
+function activityStore(value) {
+  if (value == null) return undefined;
+  requires(
+    typeof value.load === "function" && typeof value.save === "function",
+    "An activity store needs load and save functions.",
+    "INVALID_PARAMS",
+  );
+  return value;
+}
+
+// A stored row's receive status. Anything malformed drops the field, never
+// the row, and nothing is spread from the stored value.
+function ledgerReceiveStatus(value) {
+  try {
+    if (!value || typeof value !== "object" || !RECEIVE_PHASES.has(value.phase))
+      return undefined;
+    const transactions = Array.isArray(value.transactions)
+      ? value.transactions
+          .filter((tx) => boundedId(tx?.txid) && Number.isSafeInteger(tx.amountSats))
+          .map((tx) => ({
+            txid: tx.txid,
+            amountSats: tx.amountSats,
+            confirmed: tx.confirmed === true,
+          }))
+      : undefined;
+    return {
+      phase: value.phase,
+      receivedSats: integerField(value.receivedSats, "received amount"),
+      confirmedSats: integerField(value.confirmedSats, "confirmed amount"),
+      pendingSats: integerField(value.pendingSats ?? 0, "pending amount"),
+      ...(value.method === "lightning" || value.method === "bitcoin"
+        ? { method: value.method }
+        : {}),
+      ...(boundedId(value.activityId) ? { activityId: value.activityId } : {}),
+      ...(boundedId(value.paymentHash)
+        ? { paymentHash: value.paymentHash.toLowerCase() }
+        : {}),
+      txids: Array.isArray(value.txids) ? value.txids.filter(boundedId) : [],
+      ...(boundedId(value.txid) ? { txid: value.txid } : {}),
+      ...(transactions ? { transactions } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+// A stored row's saved request: the shape the registry returned, or the
+// legacy invoice metadata, rebuilt through the same validators.
+function ledgerReceiveRequest(value, paymentHash) {
+  try {
+    if (!value || typeof value !== "object") return undefined;
+    if (value.legacy === true)
+      return legacyReceiveRequest({
+        bolt11: value.bolt11,
+        paymentHash,
+        amountSats: value.amountSats,
+        description: value.description,
+        createdAt: value.createdAt,
+        expiry: Number.isFinite(value.expiresAt) && Number.isFinite(value.createdAt)
+          ? Math.max(0, (value.expiresAt - value.createdAt) / 1000)
+          : 3600,
+      });
+    const request = publicStoredRequest(value);
+    return request.paymentHash === paymentHash ? request : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// A row as an app's store hands it back. Only a completed sent, received or
+// transfer row qualifies; anything else, or anything malformed, is null.
+function ledgerRow(raw) {
+  try {
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.status !== "completed" || !ACTIVITY_KINDS.has(raw.kind)) return null;
+    const id = boundedText(raw.id, 256);
+    const reference = boundedText(raw.reference, 256);
+    if (!id || !reference) return null;
+    if (!Number.isFinite(raw.timestamp) || raw.timestamp < 0) return null;
+    const row = {
+      id,
+      kind: raw.kind,
+      title: boundedText(raw.title, 256),
+      description: boundedText(raw.description, 1024),
+      amountSats: integerField(raw.amountSats, "activity amount"),
+      feeSats: integerField(raw.feeSats ?? 0, "activity fee"),
+      feeKnown: raw.feeKnown === true,
+      feeEstimated: raw.feeEstimated === true,
+      status: "completed",
+      timestamp: raw.timestamp,
+      reference,
+    };
+    if (boundedId(raw.txid)) row.txid = raw.txid;
+    if (boundedId(raw.paymentHash)) row.paymentHash = raw.paymentHash.toLowerCase();
+    if (boundedId(raw.address)) row.address = raw.address;
+    const receiveRequest = ledgerReceiveRequest(raw.receiveRequest, row.paymentHash);
+    if (receiveRequest) row.receiveRequest = receiveRequest;
+    const receiveStatus = ledgerReceiveStatus(raw.receiveStatus);
+    if (receiveStatus) row.receiveStatus = receiveStatus;
+    return row;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold one read into what the wallet already knew. `known` is the wallet's
+ * ledger of completed rows by id; `read` is this snapshot's rows. A read row
+ * wins over the ledger unless it shows less than a completed row with the
+ * same id (a pruned payment read as an unpaid request, a confirmed
+ * transaction read as pending): forward moves such as a fee becoming known
+ * or a receipt reclassified as a transfer flow through, a regression does
+ * not. Completed rows the read no longer lists are kept, unless a read row
+ * carries the same reference: a submission the engine now reports under its
+ * transaction or payment id is the same row, not a lost one.
+ */
+function restoreActivity(known, read) {
+  const ids = new Set(read.map((row) => row.id));
+  const references = new Set(read.map((row) => row.reference));
+  const rows = read.map((row) =>
+    row.status !== "completed" && known.has(row.id)
+      ? { ...known.get(row.id) }
+      : row,
+  );
+  const kept = [...known.values()]
+    .filter((row) => !ids.has(row.id) && !references.has(row.reference))
+    .map((row) => ({ ...row }));
+  return { rows: [...rows, ...kept], kept: new Set(kept) };
+}
+
 // Managers persist arbitrary Error.message values here, including errors from
 // remote transports. Publish fixed diagnostics instead of copying their payload,
 // which may contain credentials, stack traces, or private wallet data.
@@ -616,6 +761,75 @@ export class WalletClient {
     this._receiveStatusCache = new Map();
     this._savedReceiveRequests = [];
     this._epoch = 0;
+    // Completed activity per wallet, what the wallet has shown and must never
+    // show less than (wallet-core #19). Keyed by wallet id, so selectWallet
+    // leaves it alone; createWallet starts a fresh one for the new wallet.
+    this._store = activityStore(options.store);
+    this._ledgers = new Map();
+    this._ledgerLoads = new Map();
+  }
+  /**
+   * The wallet's ledger of completed rows, loaded from the app's store the
+   * first time a wallet is read and kept in memory afterwards. A store that
+   * fails or hands back nothing usable leaves an empty ledger; the reads
+   * fill it from then on.
+   */
+  _ledgerFor(walletId) {
+    if (!walletId) return Promise.resolve(new Map());
+    let load = this._ledgerLoads.get(walletId);
+    if (!load) {
+      load = (async () => {
+        const ledger = new Map();
+        if (this._store)
+          try {
+            const rows = await this._store.load(walletId);
+            if (Array.isArray(rows))
+              for (const raw of rows) {
+                const row = ledgerRow(raw);
+                if (row && !ledger.has(row.id)) ledger.set(row.id, row);
+              }
+          } catch {}
+        this._ledgers.set(walletId, ledger);
+        return ledger;
+      })();
+      this._ledgerLoads.set(walletId, load);
+    }
+    return load;
+  }
+  // A wallet created under an id the client has seen before must not inherit
+  // the old wallet's history.
+  async _resetLedger(walletId) {
+    const ledger = new Map();
+    this._ledgers.set(walletId, ledger);
+    this._ledgerLoads.set(walletId, Promise.resolve(ledger));
+    if (this._store)
+      try {
+        await this._store.save(walletId, []);
+      } catch {}
+  }
+  // Remember every completed row this snapshot shows. The store hears about
+  // it only when something changed, and a store that fails never fails the
+  // snapshot.
+  async _commitLedger(walletId, rows) {
+    const ledger = this._ledgers.get(walletId);
+    if (!ledger) return;
+    let changed = false;
+    for (const row of rows) {
+      if (row.status !== "completed") continue;
+      const { receiveStatusUnavailable, ...final } = row;
+      const previous = ledger.get(row.id);
+      if (previous && JSON.stringify(previous) === JSON.stringify(final))
+        continue;
+      ledger.set(row.id, clone(final));
+      changed = true;
+    }
+    if (changed && this._store)
+      try {
+        await this._store.save(
+          walletId,
+          [...ledger.values()].sort((a, b) => b.timestamp - a.timestamp),
+        );
+      } catch {}
   }
   selectWallet(id) {
     requires(
@@ -845,6 +1059,7 @@ export class WalletClient {
           .map((warning) => warning.trim().slice(0, 512))
       : [];
     this.selectWallet(wallet.id);
+    await this._resetLedger(wallet.id);
     return {
       ...wallet,
       ...(typeof created.mnemonic === "string"
@@ -977,7 +1192,9 @@ export class WalletClient {
   }
   async snapshot() {
     const epoch = this._epoch;
+    const walletId = this.connection.walletId;
     const [
+      ledger,
       rec,
       info,
       balance,
@@ -992,6 +1209,7 @@ export class WalletClient {
       savedRequests,
       offline,
     ] = await Promise.all([
+      this._ledgerFor(walletId),
       this._record(),
       this._get("/info"),
       this._get("/balance"),
@@ -1192,14 +1410,31 @@ export class WalletClient {
       ).filter((row) => !row.txid || !journalTxids.has(row.txid)),
       ...journal,
     ];
+    // What the wallet already knew joins the read before the saved requests
+    // are reconciled, so a remembered receipt marks its request paid and a
+    // remembered coin is folded into its request like a freshly read one.
+    const restored = restoreActivity(ledger, activity);
     activity = await this._reconcileReceiveActivity({
-      activity,
+      activity: restored.rows,
       savedRequests,
       payments,
       invoices,
       notes,
     });
     this._assertEpoch(epoch);
+    // A remembered row the read now reports under another id (a journal row
+    // for its transaction, a request for its coin) is shown once: the read's
+    // row stands, the remembered one yields.
+    activity = activity.filter(
+      (row) =>
+        !restored.kept.has(row) ||
+        !activity.some(
+          (other) =>
+            !restored.kept.has(other) &&
+            ((row.txid && other.txid === row.txid) ||
+              (row.paymentHash && other.paymentHash === row.paymentHash)),
+        ),
+    );
     const knownReferences = new Set(activity.map((row) => row.reference));
     const knownIds = new Set(activity.map((row) => row.id));
     const local = this._localActivity
@@ -1216,6 +1451,11 @@ export class WalletClient {
           `${this.connection.walletId}:${payment.paymentHash}`,
         );
     const wallet = publicWallet(rec);
+    const rows = [...activity, ...local].sort(
+      (a, b) => b.timestamp - a.timestamp,
+    );
+    await this._commitLedger(walletId, rows);
+    this._assertEpoch(epoch);
     return {
       wallet,
       balance: {
@@ -1228,9 +1468,7 @@ export class WalletClient {
           ? { offlineReceivableSats: offline.maxSats }
           : {}),
       },
-      activity: [...activity, ...local].sort(
-        (a, b) => b.timestamp - a.timestamp,
-      ),
+      activity: rows,
       primary: {
         uri: text(rec.lfbw.primaryUri),
         connected: status.primaryConnected,
@@ -2215,6 +2453,13 @@ export class WalletClient {
         )
           return false;
         const previous = cache.get(request.paymentHash);
+        // A receipt settled over Lightning is final. No address history can
+        // revise it, and a later coin on that address is its own receive.
+        if (
+          previous?.status?.method === "lightning" &&
+          previous.status.phase === "completed"
+        )
+          return false;
         const ttl = previous?.failed
           ? 60000
           : previous?.status?.phase === "completed"
@@ -2262,6 +2507,32 @@ export class WalletClient {
       const observation = cache.get(request.paymentHash);
       const status = observation?.status;
       const received = status && status.phase !== "waiting";
+      const unavailable =
+        !observation ||
+        observation.failed ||
+        registryUnavailable ||
+        (request.bitcoinTracking === "ambiguous" &&
+          status?.method !== "lightning");
+      // A receipt the wallet already showed as complete stays complete when
+      // this read and its lookup show less: a lookup that failed or has not
+      // run yet since a relaunch, or an engine that forgot the payment.
+      if (
+        existing?.kind === "received" &&
+        existing.status === "completed" &&
+        status?.phase !== "completed"
+      ) {
+        const remembered = {
+          ...existing,
+          receiveRequest: request,
+          ...(unavailable ? { receiveStatusUnavailable: true } : {}),
+        };
+        if (remembered.receiveStatusUnavailable) anyUnavailable = true;
+        replacements.set(request.paymentHash, remembered);
+        if (existing.receiveStatus?.method === "bitcoin")
+          for (const tx of existing.receiveStatus.transactions ?? [])
+            covered.set(tx.txid, (covered.get(tx.txid) || 0) + tx.amountSats);
+        continue;
+      }
       const row = {
         ...(existing || {}),
         id: existing?.id || `payment:${request.paymentHash}`,
@@ -2291,13 +2562,7 @@ export class WalletClient {
         receiveRequest: request,
         ...(status ? { receiveStatus: status } : {}),
         ...(status?.txid ? { txid: status.txid } : {}),
-        ...(!observation ||
-        observation.failed ||
-        registryUnavailable ||
-        (request.bitcoinTracking === "ambiguous" &&
-          status?.method !== "lightning")
-          ? { receiveStatusUnavailable: true }
-          : {}),
+        ...(unavailable ? { receiveStatusUnavailable: true } : {}),
       };
       if (row.receiveStatusUnavailable) anyUnavailable = true;
       replacements.set(request.paymentHash, row);
@@ -2326,6 +2591,7 @@ export class WalletClient {
     const [payments, invoices] = await Promise.all([
       this._get("/payments"),
       this._get("/invoices"),
+      this._ledgerFor(this.connection.walletId),
     ]);
     this._assertEpoch(epoch);
     const status = await this._receiveStatusFor(request, payments, invoices);
@@ -2378,7 +2644,16 @@ export class WalletClient {
       this._now(),
     ).find(
       (entry) => entry.kind === "received" && entry.status === "completed",
-    );
+    ) ||
+      // A receipt the wallet already showed as settled over Lightning stays
+      // settled when the engine's lists no longer carry the payment.
+      [...(this._ledgers.get(this.connection.walletId)?.values() ?? [])].find(
+        (entry) =>
+          entry.kind === "received" &&
+          entry.status === "completed" &&
+          !entry.txid &&
+          text(entry.paymentHash).toLowerCase() === paymentHash,
+      );
     // A settled invoice proves fulfillment even when JIT fees make its actual
     // receipt smaller than the requested face amount. Never infer this from a
     // same-amount payment, an issued invoice, or a pending incoming HTLC.
@@ -2876,7 +3151,7 @@ export class DemoWalletClient {
  * this adapter never creates an HTTP request or falls back to a wallet host.
  */
 export class EmbeddedWalletClient extends WalletClient {
-  constructor({ runtime, walletId } = {}) {
+  constructor({ runtime, walletId, store } = {}) {
     requires(
       runtime && typeof runtime.request === "function",
       "A local wallet engine is required.",
@@ -2897,6 +3172,7 @@ export class EmbeddedWalletClient extends WalletClient {
             "EMBEDDED_HTTP_FORBIDDEN",
           );
         },
+        store,
       },
     );
     this.connection = Object.freeze({

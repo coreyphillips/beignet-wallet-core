@@ -341,10 +341,26 @@ export class WalletError extends Error {
   status?: number;
   constructor(message: string, code?: string, status?: number);
 }
+/**
+ * Where a client keeps each wallet's completed activity between launches.
+ * `load` returns the rows the client last saved for the wallet (anything
+ * malformed is ignored); `save` receives every completed row, newest first.
+ * Without a store the ledger lives in memory for the client's lifetime.
+ */
+export interface ActivityStore {
+  load(
+    walletId: string,
+  ): Activity[] | null | undefined | Promise<Activity[] | null | undefined>;
+  save(walletId: string, rows: Activity[]): void | Promise<void>;
+}
 export class WalletClient implements WalletClientInterface {
   constructor(
     connection: Connection,
-    options?: { fetch?: typeof globalThis.fetch; now?: () => number },
+    options?: {
+      fetch?: typeof globalThis.fetch;
+      now?: () => number;
+      store?: ActivityStore;
+    },
   );
   readonly connection: Connection;
   readonly demo: boolean;
@@ -476,7 +492,11 @@ export interface EmbeddedRuntime {
   close?(): void | Promise<void>;
 }
 export class EmbeddedWalletClient extends WalletClient {
-  constructor(options: { runtime: EmbeddedRuntime; walletId?: string });
+  constructor(options: {
+    runtime: EmbeddedRuntime;
+    walletId?: string;
+    store?: ActivityStore;
+  });
   readonly embedded: true;
   close(): Promise<void>;
 }
