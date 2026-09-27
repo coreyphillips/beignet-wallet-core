@@ -80,9 +80,11 @@ export interface WalletSnapshot {
     availableSats: number;
     pendingSats: number;
     /**
-     * What `pendingSats` is made of. The six parts always sum to it.
+     * What `pendingSats` is made of. The six parts always sum to it. Every
+     * snapshot carries it; the field is optional so a host's own snapshot
+     * fixtures and older readings still type-check.
      */
-    pending: {
+    pending?: {
       /** Unconfirmed deposits. */
       unconfirmedSats: number;
       /** Confirmed on-chain funds not yet in a channel. */
