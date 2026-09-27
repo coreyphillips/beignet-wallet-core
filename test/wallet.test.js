@@ -707,6 +707,65 @@ test("receive without inbound requires online primary and quoted fee policy is c
   });
 });
 
+test("receive after a primary switch reuses inbound on the previous primary's channel instead of asking for JIT", async () => {
+  // wallet-core #18: the channel with the previous primary stays open and
+  // keeps receiving until it is moved, so a receive it can take is a plain
+  // invoice, and the receivable figure counts it.
+  const NEW_PK = "02" + "11".repeat(32);
+  const switched = {
+    ...record,
+    lfbw: {
+      ...record.lfbw,
+      primaryPubkey: NEW_PK,
+      previousPrimary: { pubkey: PK },
+    },
+  };
+  const { client, calls } = fixture({
+    "/api/wallets": [switched],
+    "/api/wallets/wallet-1": switched,
+    "/peers": [{ pubkey: NEW_PK, state: "connected" }],
+  });
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.receivableSats, 100000);
+  const quote = await client.quoteReceive({ amountSats: 10000 });
+  assert.equal(quote.feeSats, 0);
+  await client.receive(quote);
+  assert.equal(calls.filter((c) => c.path === "/invoice/create").length, 1);
+  assert.ok(!calls.some((c) => c.path === "/jit/quote"));
+  assert.ok(!calls.some((c) => c.path === "/jit/invoice"));
+});
+
+test("receive after a primary switch still plans JIT through the new primary when no channel has the inbound", async () => {
+  const NEW_PK = "02" + "11".repeat(32);
+  const switched = {
+    ...record,
+    lfbw: {
+      ...record.lfbw,
+      primaryPubkey: NEW_PK,
+      previousPrimary: { pubkey: PK },
+    },
+  };
+  const { client, calls } = fixture({
+    "/api/wallets": [switched],
+    "/api/wallets/wallet-1": switched,
+    "/channels": [{ ...channel, remoteBalanceSats: 0 }],
+    "/peers": [{ pubkey: NEW_PK, state: "connected" }],
+    "/jit/quote": {
+      accepted: true,
+      withinCeilings: true,
+      flatFeeSat: 10,
+      feePpm: 101,
+      feeSats: 12,
+    },
+  });
+  const quote = await client.quoteReceive({ amountSats: 10000 });
+  assert.equal(quote.feeSats, 12);
+  const jit = calls.find((c) => c.path === "/jit/quote");
+  assert.ok(jit);
+  assert.equal(new URLSearchParams(jit.query).get("lspPubkey"), NEW_PK);
+  assert.ok(!calls.some((c) => c.path === "/invoice/create"));
+});
+
 test("embedded JIT quote timeout explains the provider check without creating an invoice or address", async () => {
   const { client, calls } = embeddedFixture({
     "/channels": [],

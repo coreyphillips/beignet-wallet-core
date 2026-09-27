@@ -1765,6 +1765,7 @@ export class WalletClient {
       wantedSats: amount || 0,
       channels,
       primaryPubkey: rec.lfbw.primaryPubkey,
+      previousPrimary: rec.lfbw.previousPrimary || null,
       setup: rec.lfbw.setup,
       primaryConnected: connected,
     });

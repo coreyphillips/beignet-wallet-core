@@ -45,25 +45,37 @@ export function previousPrimaryChannels(channels, previousPrimary) {
 }
 
 /**
- * Which invoice to mint. `plain` when the home channel can take the amount
- * as it stands, so a briefly offline primary does not block a receive the
- * channel already covers; `jit` when the primary has to provision inbound
- * first (POST /jit/invoice registers the intent with the primary, which
- * opens a channel when none exists and splices the existing one bigger
- * when the payment outgrows it); a refusal when nothing can be minted yet.
+ * What the wallet can receive over its live channels as they stand: the
+ * usable channels with the current primary and, after a re-point, with the
+ * previous one. That channel stays open and keeps receiving until it is
+ * moved, so a receive it can take needs no provisioning (wallet-core #18).
+ */
+export function receivableSats(channels, primaryPubkey, previousPrimary) {
+	return [...primaryChannels(channels, primaryPubkey), ...previousPrimaryChannels(channels, previousPrimary)]
+		.filter(usable)
+		.reduce((sum, c) => sum + (c.remoteBalanceSats || 0), 0);
+}
+
+/**
+ * Which invoice to mint. `plain` when the wallet's live channels, with the
+ * current or the previous primary, can take the amount as they stand, so a
+ * briefly offline primary does not block a receive a channel already
+ * covers; `jit` when the primary has to provision inbound first (POST
+ * /jit/invoice registers the intent with the primary, which opens a channel
+ * when none exists and splices the existing one bigger when the payment
+ * outgrows it); a refusal when nothing can be minted yet.
  */
 export function planInvoice({
 	wantedSats = 0,
 	channels,
 	primaryPubkey,
+	previousPrimary = null,
 	setup,
 	primaryRunning = true,
 	primaryConnected = true
 }) {
 	if (setup !== 'ready' || !primaryPubkey) return { kind: 'refuse', code: 'NOT_READY' };
-	const inbound = primaryChannels(channels, primaryPubkey)
-		.filter(usable)
-		.reduce((sum, c) => sum + (c.remoteBalanceSats || 0), 0);
+	const inbound = receivableSats(channels, primaryPubkey, previousPrimary);
 	const covered = wantedSats > 0 ? inbound >= wantedSats : inbound > 0;
 	if (covered) return { kind: 'plain' };
 	if (!primaryRunning) return { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-running' };
@@ -179,7 +191,9 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 		: home
 		? home.localBalanceSats || 0
 		: 0;
-	const canReceive = withPrimary.filter(usable).reduce((s, c) => s + (c.remoteBalanceSats || 0), 0);
+	// Inbound on the previous primary's channel counts too: it receives until
+	// it is moved, and the invoice plan agrees (wallet-core #18).
+	const canReceive = receivableSats(channels, primaryPubkey, (lf && lf.previousPrimary) || null);
 	const lightning = balance ? balance.lightning || 0 : (info && info.lightningBalanceSats) || 0;
 	const pending = unconfirmed + confirmedOnchain + openingSats + splicingSats;
 	const total = lightning + onchain + openingSats + splicingSats;
