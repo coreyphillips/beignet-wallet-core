@@ -13,7 +13,11 @@ import {
   mergeActivity,
 } from "../src/index.js";
 import { bech32Encode, convertBits } from "../src/payment-uri.js";
-import { arrivingFundsNote, CHANNELIZE_FLOOR_SATS } from "../src/lfbw.js";
+import {
+  arrivingFundsNote,
+  lfbwStatus,
+  CHANNELIZE_FLOOR_SATS,
+} from "../src/lfbw.js";
 import {
   base64urlDecode,
   base64urlEncode,
@@ -2449,13 +2453,14 @@ test("a Bitcoin send is refused while the channel's own funding is unconfirmed",
 test("a payment within the total but above what can be sent explains what is arriving", async () => {
   // The fixture holds 202,500 sats in total (200,000 Lightning, 2,000 arriving
   // on-chain, 500 in a splice) but can only send 180,000 out to an address.
-  // "Not enough funds" would be wrong: the money is there, it is just moving.
+  // For a payment 2,000 over that, "Not enough funds" would be wrong: the
+  // money is there, it is just moving.
   const { client } = embeddedFixture();
   await assert.rejects(
-    client.prepareSend({ request: ADDRESS, amountSats: 195000 }),
+    client.prepareSend({ request: ADDRESS, amountSats: 182000 }),
     (error) => {
       assert.equal(error.code, "INSUFFICIENT_FUNDS");
-      assert.match(error.message, /15,000 sats more than you can send/);
+      assert.match(error.message, /2,000 sats more than you can send/);
       assert.match(error.message, /2,000 sats arriving on-chain/);
       assert.match(error.message, /500 sats rejoin your balance/);
       assert.match(error.message, /request stays here to try again/);
@@ -2471,6 +2476,37 @@ test("a payment within the total but above what can be sent explains what is arr
       assert.equal(error.code, "INSUFFICIENT_FUNDS");
       assert.match(error.message, /available balance is too low/);
       assert.doesNotMatch(error.message, /arriving on-chain/);
+      return true;
+    },
+  );
+});
+
+test("a shortfall that nothing arriving covers gets the plain refusal", async () => {
+  // Total includes the channel reserve, which is never sendable. With nothing
+  // arriving, a payment inside that gap used to be told "0 sats on their way
+  // into your channel" and that it could try again.
+  const { client } = embeddedFixture({
+    "/balance": { onchain: 0, lightning: 10500, splicingSats: 0 },
+    "/liquidity": { sendableSats: 9500 },
+    "/utxos": [],
+  });
+  await assert.rejects(client.prepareSend({ request: INVOICE }), (error) => {
+    assert.equal(error.code, "INSUFFICIENT_FUNDS");
+    assert.match(error.message, /You can send up to 9,500 sats over Lightning/);
+    assert.doesNotMatch(error.message, /on their way|try again/);
+    return true;
+  });
+
+  // Something is arriving, but less than the payment is short: the reserve
+  // and the splice fee make up the rest, and waiting does not make the
+  // payment possible.
+  const { client: partly } = embeddedFixture();
+  await assert.rejects(
+    partly.prepareSend({ request: ADDRESS, amountSats: 195000 }),
+    (error) => {
+      assert.equal(error.code, "INSUFFICIENT_FUNDS");
+      assert.match(error.message, /available balance is too low/);
+      assert.doesNotMatch(error.message, /arriving on-chain|try again/);
       return true;
     },
   );
@@ -2610,6 +2646,25 @@ test("the arriving-funds note speaks in the wallet's own terms, never the manage
     confirmedOnchain: CHANNELIZE_FLOOR_SATS - 1,
   });
   assert.match(small, new RegExp(CHANNELIZE_FLOOR_SATS.toLocaleString("en-US")));
+});
+
+test("the arriving-funds note only speaks when what is arriving covers the shortfall", () => {
+  // 1,000 sats of the 100,000 total are the channel reserve.
+  const status = {
+    canSend: 99000,
+    total: 100000,
+    unconfirmed: 0,
+    confirmedOnchain: 0,
+    feeWait: null,
+    pending: 0,
+    pendingChannels: [],
+  };
+  assert.equal(arrivingFundsNote(99500, status), null);
+  const arriving = { ...status, total: 100300, unconfirmed: 300, pending: 300 };
+  assert.equal(arrivingFundsNote(99500, arriving), null);
+  const note = arrivingFundsNote(99200, arriving);
+  assert.match(note, /200 sats more than you can send/);
+  assert.match(note, /300 sats arriving on-chain/);
 });
 
 test("an existing recovery phrase is sent once for a restore and checked for shape first", async () => {
@@ -2916,6 +2971,64 @@ test("confirmed on-chain funds say what the wallet is doing with them", async ()
   }));
   note = (await client.snapshot()).notes.find((n) => n.startsWith("20,000 sats confirmed"));
   assert.match(note, /move at 25,000 sats/);
+});
+
+test("a wait on confirmed funds is never described as a move", async () => {
+  const withLfbw = (extra) => ({ ...record, lfbw: { ...record.lfbw, ...extra } });
+  const wait = (reason) =>
+    withLfbw({ lastChannelize: { action: "wait", reason, at: NOW - 1000 } });
+  // A deposit still unconfirmed holds every move back.
+  let { client } = fixture({
+    "/balance": { onchain: 32000, lightning: 200000, splicingSats: 0 },
+    "/utxos": [
+      { height: 800000, valueSats: 30000 },
+      { height: 0, valueSats: 2000 },
+    ],
+    "/api/wallets/wallet-1": wait("unconfirmed"),
+  });
+  let notes = (await client.snapshot()).notes;
+  let note = notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /once the arriving sats confirm/);
+  assert.ok(!notes.some((n) => /Moving them now/.test(n)), notes.join(" | "));
+  // The page's own figures read the decision the same way.
+  const page = lfbwStatus({
+    rec: wait("unconfirmed"),
+    balance: { onchain: 32000, lightning: 200000, splicingSats: 0 },
+    channels: [channel],
+    utxos: [
+      { height: 800000, valueSats: 30000 },
+      { height: 0, valueSats: 2000 },
+    ],
+  });
+  assert.ok(
+    page.notes.includes("30,000 sats confirmed. They move once the arriving sats confirm."),
+    page.notes.join(" | "),
+  );
+  // Once that deposit has confirmed, the wait is over.
+  const confirmed = {
+    "/balance": { onchain: 30000, lightning: 200000, splicingSats: 0 },
+    "/utxos": [{ height: 800000, valueSats: 30000 }],
+  };
+  ({ client } = fixture({ ...confirmed, "/api/wallets/wallet-1": wait("unconfirmed") }));
+  note = (await client.snapshot()).notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /Moving them now/);
+  // The fee leaves too little to move: nothing moves until it drops.
+  ({ client } = fixture({ ...confirmed, "/api/wallets/wallet-1": wait("quote-too-small") }));
+  note = (await client.snapshot()).notes.find((n) => n.startsWith("30,000 sats confirmed"));
+  assert.match(note, /Waiting for a lower network fee/);
+  // Once the money has moved, a decision left on the record says nothing.
+  for (const lastChannelize of [
+    { action: "wait", reason: "quote-too-small", at: NOW - 1000 },
+    { action: "splice-in", amountSats: 28000, at: NOW - 1000 },
+  ]) {
+    ({ client } = fixture({
+      "/balance": { onchain: 0, lightning: 228000, splicingSats: 0 },
+      "/utxos": [],
+      "/api/wallets/wallet-1": withLfbw({ lastChannelize }),
+    }));
+    notes = (await client.snapshot()).notes;
+    assert.ok(!notes.some((n) => /sats confirmed/.test(n)), notes.join(" | "));
+  }
 });
 
 test("diagnostics gather the engine's figures in one read and never carry secrets", async () => {
