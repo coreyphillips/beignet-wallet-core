@@ -28,7 +28,7 @@ const result = await wallet.send(review);
 
 A failed snapshot read throws instead of displaying zero. Total includes the daemon's distinct Lightning, Bitcoin, splice, pending-close and errored buckets. Opening-channel balances are added only after their funding transaction is observed, avoiding double counting funds still held as UTXOs. Disconnected and restore-held channel balances are already included in the daemon's Lightning balance. Available uses its spendable liquidity figure, which excludes reserves. `balance.pending` breaks the pending figure into its parts (unconfirmed, confirmed on-chain, opening, splicing, closing, errored) so an app can say which kind of money is waiting.
 
-Payments and invoices share their payment hash, so a paid request becomes one received item. Matching channel funding transactions display as internal transfers. Explicit submitted Bitcoin sends retain their sent label. General activity exposes no payment preimage, seed, payment secret or unrestricted metadata. `feeKnown:false` means the daemon did not disclose a fee; `feeEstimated:true` means the value is a reviewed quote rather than an actual charge. Missing fees are never labeled as a known zero. Some recovery actions and transfers away from a previous primary still need advanced management tools. In host mode these are available through the host; embedded mode does not yet expose them. The journal reports its verified status; a pending initiation is not a confirmed transaction.
+A wallet never shows less than it already knew: each read is folded into a per-wallet ledger of completed rows, so an engine that lists fewer payments, a failed lookup or a relaunch never shortens the history or moves a completed row back to pending, expired or failed. Payments and invoices share their payment hash, so a paid request becomes one received item. Matching channel funding transactions display as internal transfers. Explicit submitted Bitcoin sends retain their sent label. General activity exposes no payment preimage, seed, payment secret or unrestricted metadata. `feeKnown:false` means the daemon did not disclose a fee; `feeEstimated:true` means the value is a reviewed quote rather than an actual charge. Missing fees are never labeled as a known zero. Some recovery actions and transfers away from a previous primary still need advanced management tools. In host mode these are available through the host; embedded mode does not yet expose them. The journal reports its verified status; a pending initiation is not a confirmed transaction.
 
 ## Startup and synchronization
 
@@ -36,7 +36,7 @@ Payments and invoices share their payment hash, so a paid request becomes one re
 
 ## Connection and recovery
 
-Bearer tokens remain in memory in this package. The caller chooses secure storage, and must never serialize the creation response because it may contain a mnemonic. HTTP is accepted only for loopback and Android emulator host `10.0.2.2`; remote hosts require HTTPS. URLs containing embedded credentials, query strings or paths are rejected. Fetches omit cookies, request no-store caching, and refuse redirects.
+Bearer tokens remain in memory in this package. The completed-activity ledger also lives in memory unless the app passes a `store` (`{ load(walletId), save(walletId, rows) }`) when constructing the client; the package never persists anything on its own. The caller chooses secure storage, and must never serialize the creation response because it may contain a mnemonic. HTTP is accepted only for loopback and Android emulator host `10.0.2.2`; remote hosts require HTTPS. URLs containing embedded credentials, query strings or paths are rejected. Fetches omit cookies, request no-store caching, and refuse redirects.
 
 New wallets enable peer-storage channel recovery. Seed words alone do not contain the latest Lightning channel state; the host data and peer recovery capabilities still matter. Creation returns the manager's mnemonic to the deliberate backup view once. `getRecoveryPhrase()` is an explicit authenticated read for that same view, and the phrase must be cleared when it closes. No real recovery phrases are used in tests.
 
@@ -58,7 +58,7 @@ The payment URI, funding envelope and LFBW reference logic were adapted from the
 import { EmbeddedWalletClient } from '@beignet/wallet-core';
 
 // runtime is a real createPortableRuntime(...) instance or its worker RPC.
-const wallet = new EmbeddedWalletClient({ runtime });
+const wallet = new EmbeddedWalletClient({ runtime, store }); // store is optional
 const wallets = await wallet.listWallets();
 if (wallets.length) wallet.selectWallet(wallets[0].id);
 ```

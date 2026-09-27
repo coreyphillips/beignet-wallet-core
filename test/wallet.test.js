@@ -57,7 +57,7 @@ const result = (body, status = 200) => ({
   status,
   json: async () => body,
 });
-function fixture(overrides = {}) {
+function fixture(overrides = {}, options = {}) {
   let now = NOW;
   const calls = [];
   const storedRequests = [];
@@ -151,6 +151,7 @@ function fixture(overrides = {}) {
     { url: "http://127.0.0.1:8787", token: "test-token", walletId: record.id },
     {
       now: () => now,
+      ...(options.store ? { store: options.store } : {}),
       fetch: async (url, options) => {
         const path = new URL(url).pathname.replace(
           /^\/wallets\/[^/]+\/api/,
@@ -187,10 +188,11 @@ function fixture(overrides = {}) {
   };
 }
 
-function embeddedFixture(overrides = {}) {
+function embeddedFixture(overrides = {}, options = {}) {
   const backing = fixture(overrides);
   const client = new EmbeddedWalletClient({
     walletId: record.id,
+    ...(options.store ? { store: options.store } : {}),
     runtime: {
       async request(command) {
         const response = await backing.client._fetch(
@@ -1955,6 +1957,398 @@ test("saved unified requests survive client restart and reconcile exact Bitcoin 
     "completed",
     "registered request still settles after invoice pruning and client restart",
   );
+});
+
+// wallet-core #19: a wallet never shows less than it already knew.
+const SENT_HASH = "cd".repeat(32);
+const sentPayment = (extra = {}) => ({
+  paymentHash: SENT_HASH,
+  direction: "OUTGOING",
+  status: "COMPLETED",
+  amountSats: 90001,
+  createdAt: NOW - 60000,
+  completedAt: NOW - 59000,
+  ...extra,
+});
+const paidIncoming = {
+  paymentHash: HASH,
+  direction: "INCOMING",
+  status: "COMPLETED",
+  amountSats: 10000,
+  createdAt: NOW,
+  completedAt: NOW + 1000,
+};
+const paidInvoice = {
+  paymentHash: HASH,
+  bolt11: INVOICE,
+  status: "PAID",
+  amountSats: 10000,
+  createdAt: NOW / 1000,
+  expiry: 600,
+};
+const expiredInvoice = { ...paidInvoice, status: "EXPIRED" };
+function memoryStore() {
+  const saved = {};
+  const store = {
+    saves: 0,
+    saved,
+    load: (walletId) => saved[walletId],
+    save: (walletId, rows) => {
+      saved[walletId] = rows;
+      store.saves++;
+    },
+  };
+  return store;
+}
+
+test("a completed Lightning send stays in Activity after the engine stops listing it, and a later fuller read still updates it", async () => {
+  let payments = [sentPayment()];
+  const { client } = fixture({ "/payments": () => payments });
+  const sent = (await client.snapshot()).activity.find(
+    (row) => row.id === `payment:${SENT_HASH}`,
+  );
+  assert.equal(sent.kind, "sent");
+  assert.equal(sent.status, "completed");
+  assert.equal(sent.feeKnown, false);
+  payments = [];
+  const kept = (await client.snapshot()).activity.find(
+    (row) => row.id === `payment:${SENT_HASH}`,
+  );
+  assert.deepEqual(kept, sent);
+  // The engine lists the payment again, now with its fee: forward moves flow.
+  payments = [sentPayment({ feeSats: 12 })];
+  const updated = (await client.snapshot()).activity.find(
+    (row) => row.id === `payment:${SENT_HASH}`,
+  );
+  assert.equal(updated.feeSats, 12);
+  assert.equal(updated.feeKnown, true);
+  // A read that regresses the payment to pending does not move it back.
+  payments = [sentPayment({ status: "PENDING", feeSats: 12 })];
+  const held = (await client.snapshot()).activity.find(
+    (row) => row.id === `payment:${SENT_HASH}`,
+  );
+  assert.equal(held.status, "completed");
+  assert.equal(held.feeSats, 12);
+});
+
+test("a saved request paid over Lightning stays Payment received after the engine forgets the payment, past the status cache and in getReceiveStatus", async () => {
+  let payments = [];
+  let invoices = [];
+  const { client, calls, setNow } = fixture({
+    "/payments": () => payments,
+    "/invoices": () => invoices,
+  });
+  const request = await client.receive(
+    await client.quoteReceive({ amountSats: 10000, description: "Lunch" }),
+  );
+  payments = [paidIncoming];
+  invoices = [paidInvoice];
+  const paid = (await client.snapshot()).activity.find(
+    (row) => row.id === `payment:${HASH}`,
+  );
+  assert.equal(paid.title, "Payment received");
+  assert.equal(paid.status, "completed");
+  assert.equal(paid.receiveStatus.method, "lightning");
+  // The engine prunes the payment and the invoice reads as expired.
+  payments = [];
+  invoices = [expiredInvoice];
+  for (const at of [NOW + 2000, NOW + 301000, NOW + 3600000]) {
+    setNow(at);
+    const snapshot = await client.snapshot();
+    const rows = snapshot.activity.filter((row) => row.paymentHash === HASH);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].kind, "received");
+    assert.equal(rows[0].title, "Payment received");
+    assert.equal(rows[0].status, "completed");
+    assert.equal(rows[0].amountSats, 10000);
+    assert.equal(rows[0].receiveRequest.uri, request.uri);
+    assert.equal(rows[0].receiveStatus.method, "lightning");
+    assert.equal(rows[0].receiveStatusUnavailable, undefined);
+  }
+  const status = await client.getReceiveStatus(request);
+  assert.equal(status.phase, "completed");
+  assert.equal(status.method, "lightning");
+  assert.equal(status.receivedSats, 10000);
+  assert.ok(!calls.some((c) => c.path === "/receive/onchain"));
+});
+
+test("a coin that later reaches a Lightning-settled request's address is its own on-chain receive, never a partial payment", async () => {
+  let payments = [paidIncoming];
+  let invoices = [paidInvoice];
+  let transactions = [];
+  const txid = "33".repeat(32);
+  const { client, calls, setNow } = fixture({
+    "/payments": () => payments,
+    "/invoices": () => invoices,
+    "/transactions": () => transactions,
+    "/receive/onchain": {
+      address: ADDRESS,
+      receivedSats: 4000,
+      confirmedSats: 4000,
+      transactions: [{ txid, amountSats: 4000, confirmed: true }],
+    },
+  });
+  await client.receive(
+    await client.quoteReceive({ amountSats: 10000, description: "Lunch" }),
+  );
+  await client.snapshot();
+  payments = [];
+  invoices = [expiredInvoice];
+  transactions = [
+    {
+      txid,
+      type: "received",
+      valueSats: 4000,
+      address: ADDRESS,
+      confirmed: true,
+      timestamp: NOW + 5000,
+    },
+  ];
+  setNow(NOW + 400000);
+  const snapshot = await client.snapshot();
+  assert.deepEqual(
+    snapshot.activity.map((row) => [row.id, row.title, row.amountSats, row.status]),
+    [
+      [`transaction:${txid}`, "Bitcoin received", 4000, "completed"],
+      [`payment:${HASH}`, "Payment received", 10000, "completed"],
+    ],
+  );
+  assert.ok(
+    snapshot.activity.every((row) => row.title !== "Partial payment received"),
+  );
+  assert.ok(!calls.some((c) => c.path === "/receive/onchain"));
+});
+
+test("a relaunch on the same store shows the history the wallet had, in host and embedded mode", async () => {
+  const store = memoryStore();
+  const first = fixture(
+    { "/payments": [sentPayment(), paidIncoming], "/invoices": [paidInvoice] },
+    { store },
+  );
+  const request = await first.client.receive(
+    await first.client.quoteReceive({ amountSats: 10000, description: "Lunch" }),
+  );
+  const before = await first.client.snapshot();
+  assert.equal(before.activity.length, 2);
+  assert.equal(store.saves, 1);
+  assert.ok(store.saved["wallet-1"].every((row) => row.status === "completed"));
+  await first.client.snapshot();
+  assert.equal(store.saves, 1, "an unchanged ledger is not saved again");
+  const forgetful = {
+    "GET /receive/requests": { requests: first.storedRequests },
+    "/payments": [],
+    "/invoices": [expiredInvoice],
+  };
+  for (const relaunch of [
+    fixture(forgetful, { store }),
+    embeddedFixture(forgetful, { store }),
+  ]) {
+    relaunch.setNow?.(NOW + 400000);
+    const snapshot = await relaunch.client.snapshot();
+    assert.deepEqual(
+      snapshot.activity.map((row) => [row.id, row.kind, row.title, row.amountSats, row.status]),
+      before.activity.map((row) => [row.id, row.kind, row.title, row.amountSats, row.status]),
+    );
+    const receipt = snapshot.activity.find((row) => row.id === `payment:${HASH}`);
+    assert.equal(receipt.receiveRequest.uri, request.uri);
+    assert.equal(receipt.receiveStatusUnavailable, undefined);
+    const status = await relaunch.client.getReceiveStatus(request);
+    assert.equal(status.phase, "completed");
+    assert.equal(status.method, "lightning");
+    assert.ok(!relaunch.calls.some((c) => c.path === "/receive/onchain"));
+  }
+});
+
+test("malformed store rows are ignored and a failing store never fails a snapshot", async () => {
+  const valid = {
+    id: `payment:${SENT_HASH}`,
+    kind: "sent",
+    title: "Payment sent",
+    description: "",
+    amountSats: 500,
+    feeSats: 1,
+    feeKnown: true,
+    feeEstimated: false,
+    status: "completed",
+    timestamp: NOW - 5000,
+    reference: SENT_HASH,
+    paymentHash: SENT_HASH,
+  };
+  const loaded = fixture(
+    {},
+    {
+      store: {
+        load: () => [
+          null,
+          42,
+          { id: "x" },
+          { ...valid, id: "payment:pending", status: "pending" },
+          { ...valid, id: "payment:failed", status: "failed" },
+          { ...valid, id: "request:1", kind: "request" },
+          { ...valid, id: "payment:bad-amount", amountSats: "abc" },
+          { ...valid, id: "payment:no-reference", reference: "" },
+          {
+            ...valid,
+            id: "payment:extra",
+            reference: "ef".repeat(32),
+            paymentHash: "ef".repeat(32),
+            extra: "x",
+            receiveStatus: { phase: "nonsense" },
+          },
+          valid,
+        ],
+        save: () => {},
+      },
+    },
+  );
+  const snapshot = await loaded.client.snapshot();
+  assert.deepEqual(
+    snapshot.activity.map((row) => row.id).sort(),
+    [`payment:${SENT_HASH}`, "payment:extra"],
+  );
+  const extra = snapshot.activity.find((row) => row.id === "payment:extra");
+  assert.equal("extra" in extra, false);
+  assert.equal(extra.receiveStatus, undefined);
+  const failing = fixture(
+    { "/payments": [sentPayment()] },
+    {
+      store: {
+        load: () => {
+          throw new Error("no disk");
+        },
+        save: async () => {
+          throw new Error("no disk");
+        },
+      },
+    },
+  );
+  const rows = (await failing.client.snapshot()).activity;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, `payment:${SENT_HASH}`);
+  assert.throws(
+    () => new WalletClient({ url: "http://127.0.0.1:8787", token: "t" }, { store: {} }),
+    { code: "INVALID_PARAMS" },
+  );
+});
+
+test("a Bitcoin receipt folded into its request stays one completed row after a relaunch whether the lookup fails or succeeds", async () => {
+  const store = memoryStore();
+  const issued = fixture();
+  const request = await issued.client.receive(
+    await issued.client.quoteReceive({ amountSats: 10000, description: "Lunch" }),
+  );
+  const txid = "11".repeat(32);
+  const transaction = {
+    txid,
+    type: "received",
+    valueSats: 10000,
+    address: ADDRESS,
+    confirmed: true,
+    timestamp: NOW,
+  };
+  const settled = embeddedFixture(
+    {
+      "GET /receive/requests": { requests: issued.storedRequests },
+      "/invoices": [expiredInvoice],
+      "/transactions": [transaction],
+      "/receive/onchain": {
+        address: ADDRESS,
+        transactions: [{ txid, amountSats: 10000, confirmed: true }],
+      },
+    },
+    { store },
+  );
+  await settled.client.getReceiveStatus(request);
+  const shown = await settled.client.snapshot();
+  assert.equal(shown.activity.length, 1);
+  assert.equal(shown.activity[0].status, "completed");
+  assert.equal(shown.activity[0].txid, txid);
+  assert.ok(store.saves >= 1);
+  const failing = fixture(
+    {
+      "GET /receive/requests": { requests: issued.storedRequests },
+      "/invoices": [expiredInvoice],
+      "/transactions": [transaction],
+      "/receive/onchain": new Error("lookup failed"),
+    },
+    { store },
+  );
+  const unavailable = await failing.client.snapshot();
+  assert.equal(unavailable.activity.length, 1);
+  assert.equal(unavailable.activity[0].id, `payment:${HASH}`);
+  assert.equal(unavailable.activity[0].status, "completed");
+  assert.equal(unavailable.activity[0].amountSats, 10000);
+  assert.equal(unavailable.activity[0].receiveStatusUnavailable, true);
+  const working = fixture(
+    {
+      "GET /receive/requests": { requests: issued.storedRequests },
+      "/invoices": [expiredInvoice],
+      "/transactions": [transaction],
+      "/receive/onchain": {
+        address: ADDRESS,
+        transactions: [{ txid, amountSats: 10000, confirmed: true }],
+      },
+    },
+    { store },
+  );
+  const fresh = await working.client.snapshot();
+  assert.equal(fresh.activity.length, 1);
+  assert.equal(fresh.activity[0].id, `payment:${HASH}`);
+  assert.equal(fresh.activity[0].status, "completed");
+  assert.equal(fresh.activity[0].receiveStatusUnavailable, undefined);
+});
+
+test("ledgers stay per wallet, a journal row dedupes a remembered transaction, and a wallet created under a reused id starts empty", async () => {
+  const store = memoryStore();
+  const txid = "44".repeat(32);
+  let transactions = [
+    { txid, type: "received", valueSats: 7000, confirmed: true, timestamp: NOW },
+  ];
+  let journal = [];
+  const other = { ...record, id: "wallet-2" };
+  const { client } = fixture(
+    {
+      "/transactions": () => transactions,
+      "/api/wallets/wallet-1/activity": () => journal,
+      "/api/wallets/wallet-2": other,
+      "/api/wallets/wallet-2/activity": [],
+      "POST /api/wallets": { record, warnings: [] },
+    },
+    { store },
+  );
+  const first = await client.snapshot();
+  assert.equal(first.activity[0].id, `transaction:${txid}`);
+  transactions = [];
+  client.selectWallet("wallet-2");
+  assert.equal((await client.snapshot()).activity.length, 0);
+  client.selectWallet("wallet-1");
+  const back = await client.snapshot();
+  assert.equal(back.activity.length, 1);
+  assert.equal(back.activity[0].id, `transaction:${txid}`);
+  // The host's journal now carries the same transaction under its own id.
+  journal = [
+    {
+      id: "journal-1",
+      title: "Bitcoin sent",
+      description: "",
+      amountSats: 7000,
+      feeSats: 100,
+      status: "completed",
+      timestamp: NOW,
+      reference: txid,
+      txid,
+    },
+  ];
+  const journaled = await client.snapshot();
+  assert.deepEqual(
+    journaled.activity.map((row) => row.id),
+    ["journal-1"],
+  );
+  journal = [];
+  // Erase and start over: the new wallet under the same id inherits nothing.
+  await client.createWallet({ name: "Fresh" });
+  assert.deepEqual(store.saved["wallet-1"], []);
+  assert.equal((await client.snapshot()).activity.length, 0);
 });
 
 test("legacy invoices retain their exact Lightning QR without inventing an address or linking a same-amount Bitcoin payment", async () => {
