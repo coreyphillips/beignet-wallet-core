@@ -68,3 +68,7 @@ The runtime accepts `request({method,path,body})` and returns raw command result
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Iroh primary addresses
+
+`validatePrimaryUri` and `parsePrimaryUri` accept Iroh pairing URIs, including canonical base32 or hex endpoint IDs and an optional HTTP(S) relay hint. `updatePrimary(uri, fallbackUri)` optionally configures a v3 onion address for the same Lightning public key. Omitting or clearing the fallback removes it. Snapshots expose `primary.fallbackUri`; diagnostics report `iroh-direct`, `iroh-relay`, `iroh-unknown`, or `tor` for a selected fallback, with an optional RTT. The runtime must provide an Iroh endpoint factory to use this transport.
