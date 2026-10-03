@@ -19,6 +19,7 @@ export interface WalletRecord {
     enabled: boolean;
     mode?: "external" | "internal";
     primaryUri?: string | null;
+    primaryFallbackUri?: string | null;
     primaryPubkey?: string | null;
     primaryWalletId?: string | null;
     setup?: string;
@@ -114,6 +115,7 @@ export interface WalletSnapshot {
   activity: Activity[];
   primary: {
     uri: string;
+    fallbackUri?: string | null;
     connected: boolean;
     setup: string;
     offlineReceiveAvailable?: boolean | null;
@@ -296,6 +298,8 @@ export interface WalletRecoveryStatus {
 }
 /** One read of what the engine reports about itself, for the owner to inspect. */
 export interface WalletDiagnostics {
+  primaryTransport?: 'iroh-direct' | 'iroh-relay' | 'iroh-unknown' | 'tor' | 'tcp' | 'ws' | null;
+  primaryRttMs?: number | null;
   checkedAt: number;
   demo?: boolean;
   wallet?: WalletRecord["lfbw"] | null;
@@ -353,7 +357,7 @@ export interface WalletClientInterface {
     uri: string,
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
-  updatePrimary(uri: string): Promise<WalletRecord>;
+  updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
@@ -403,7 +407,7 @@ export class WalletClient implements WalletClientInterface {
     uri: string,
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
-  updatePrimary(uri: string): Promise<WalletRecord>;
+  updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
@@ -429,7 +433,7 @@ export class DemoWalletClient implements WalletClientInterface {
     uri: string,
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
-  updatePrimary(uri: string): Promise<WalletRecord>;
+  updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
@@ -523,3 +527,13 @@ export class EmbeddedWalletClient extends WalletClient {
   readonly embedded: true;
   close(): Promise<void>;
 }
+
+export interface ParsedPrimary {
+  pubkey: string;
+  host: string;
+  port: number;
+  uri: string;
+  transport?: { type: "iroh"; endpointId: string; relayUrl?: string };
+}
+export function parsePrimaryUri(input: string): ParsedPrimary;
+export function parsePrimaryFallback(primary: ParsedPrimary, input?: string): ParsedPrimary | undefined;

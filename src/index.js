@@ -1,3 +1,5 @@
+import { parsePrimaryUri, parsePrimaryFallback } from "./primary-uri.js";
+export { parsePrimaryUri, parsePrimaryFallback } from "./primary-uri.js";
 import { parsePayment, buildBip21 } from "./payment-uri.js";
 import {
   lfbwStatus,
@@ -124,23 +126,20 @@ const jitReceiveError = (error, stage) =>
     : error;
 
 export function validatePrimaryUri(input) {
-  const uri = text(input).trim();
-  if (
-    !/^(02|03)[a-fA-F0-9]{64}@(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\]):\d{1,5}$/.test(
-      uri,
-    )
-  )
-    throw new WalletError(
-      "Enter a node URI: public key@host:port.",
-      "INVALID_PRIMARY",
+  try {
+    return parsePrimaryUri(input).uri;
+  } catch (error) {
+    throw new WalletError(error.message, "INVALID_PRIMARY");
+  }
+}
+function validatePrimaryFallback(primaryUri, fallbackUri) {
+  try {
+    return (
+      parsePrimaryFallback(parsePrimaryUri(primaryUri), fallbackUri)?.uri || null
     );
-  const port = Number(uri.slice(uri.lastIndexOf(":") + 1));
-  if (port < 1 || port > 65535)
-    throw new WalletError(
-      "The node port must be between 1 and 65535.",
-      "INVALID_PRIMARY",
-    );
-  return uri;
+  } catch (error) {
+    throw new WalletError(error.message, "INVALID_PRIMARY");
+  }
 }
 export function normalizeConnection(connection) {
   let url;
@@ -677,6 +676,7 @@ function publicWallet(rec) {
             enabled: !!rec.lfbw.enabled,
             mode: rec.lfbw.mode,
             primaryUri: rec.lfbw.primaryUri,
+            primaryFallbackUri: rec.lfbw.primaryFallbackUri,
             primaryPubkey: rec.lfbw.primaryPubkey,
             primaryWalletId: rec.lfbw.primaryWalletId,
             setup: rec.lfbw.setup,
@@ -1121,9 +1121,24 @@ export class WalletClient {
         read("/graph/info"),
       ]);
     const primaryPubkey = rec.lfbw?.primaryPubkey || null;
+    const primaryPeer = Array.isArray(peers)
+      ? peers.find(p => p.pubkey === primaryPubkey &&
+          (p.state === "connected" || p.state === "ready" || p.connected === true))
+      : null;
+    let primaryTransport = null;
+    if (primaryPeer?.transport === "iroh") {
+      const path = primaryPeer.iroh?.path;
+      primaryTransport = path === "direct" || path === "relay" ? `iroh-${path}` : "iroh-unknown";
+    } else if (primaryPeer) {
+      const onion = primaryPeer.host?.endsWith(".onion") ||
+        (rec.lfbw?.primaryUri?.includes("@iroh:") && rec.lfbw?.primaryFallbackUri);
+      primaryTransport = onion ? "tor" : primaryPeer.transport || "tcp";
+    }
     const wallet = publicWallet(rec);
     return {
       checkedAt: this._now(),
+      primaryTransport,
+      primaryRttMs: primaryPeer?.iroh?.rttMs ?? null,
       wallet: wallet.lfbw ?? null,
       blockHeight: Number.isFinite(info?.blockHeight) ? info.blockHeight : null,
       electrumConnected:
@@ -1504,6 +1519,7 @@ export class WalletClient {
       ...(reportedReservations ? { offlineReservations: reservations } : {}),
       primary: {
         uri: text(rec.lfbw.primaryUri),
+        fallbackUri: rec.lfbw.primaryFallbackUri || null,
         connected: status.primaryConnected,
         setup: rec.lfbw.setup || "pending",
         ...offlineAvailability,
@@ -2869,9 +2885,10 @@ export class WalletClient {
         : {}),
     };
   }
-  async updatePrimary(uri) {
+  async updatePrimary(uri, fallbackUri) {
     const epoch = this._epoch;
     const primaryUri = validatePrimaryUri(uri);
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
     const rec = await this._record();
     this._assertEpoch(epoch);
     const result = await this._request(
@@ -2881,10 +2898,13 @@ export class WalletClient {
         lfbw: {
           enabled: true,
           primaryUri,
+          primaryFallbackUri,
           trusted: true,
           initialChannelSats: 0,
         },
-        ...(primaryUri.includes(".onion:") ? { tor: true } : {}),
+        ...(primaryUri.includes(".onion:") || primaryFallbackUri
+          ? { tor: true }
+          : {}),
       },
     );
     this._sendReviews.clear();
@@ -3217,8 +3237,11 @@ export class DemoWalletClient {
       "DEMO_ONLY",
     );
   }
-  async updatePrimary(uri) {
-    this.wallet.lfbw.primaryUri = validatePrimaryUri(uri);
+  async updatePrimary(uri, fallbackUri) {
+    const primaryUri = validatePrimaryUri(uri);
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
+    this.wallet.lfbw.primaryUri = primaryUri;
+    this.wallet.lfbw.primaryFallbackUri = primaryFallbackUri;
     return clone(this.wallet);
   }
   async startWallet() {}

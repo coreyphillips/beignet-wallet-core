@@ -4270,3 +4270,43 @@ test("offline registration recovery refuses expired or closing invoices", async 
     }
   }
 });
+
+test('primary diagnostics identify Iroh paths and a selected Tor fallback', async () => {
+ const iro = `${PK}@iroh:${'b'.repeat(64)}`;
+ const rec = { ...record, lfbw: { ...record.lfbw, primaryUri: iro, primaryFallbackUri: DEFAULT_PRIMARY_URI } };
+ for (const path of ['direct', 'relay']) {
+  const { client } = fixture({ '/api/wallets/wallet-1': rec, '/peers': [{ pubkey: PK, state: 'connected', transport: 'iroh', iroh: { path, rttMs: 42 } }] });
+  const report = await client.diagnostics();
+  assert.equal(report.primaryTransport, `iroh-${path}`);
+  assert.equal(report.primaryRttMs, 42);
+ }
+ const { client } = fixture({ '/api/wallets/wallet-1': rec, '/peers': [{ pubkey: PK, state: 'connected', transport: 'tcp', host: 'b'.repeat(64) }] });
+ assert.equal((await client.diagnostics()).primaryTransport, 'tor');
+});
+
+
+test("primary update persists and clears same-key Iroh fallback before sending configuration", async () => {
+  const uri = `${PK}@iroh:${"b".repeat(64)}`;
+  const { client, calls } = fixture({ "PATCH /api/wallets/wallet-1": record });
+  await client.updatePrimary(uri, DEFAULT_PRIMARY_URI);
+  assert.equal(
+    calls.find((c) => c.method === "PATCH").body.lfbw.primaryFallbackUri,
+    DEFAULT_PRIMARY_URI
+  );
+  assert.equal(calls.find((c) => c.method === "PATCH").body.tor, true);
+  await client.updatePrimary(uri);
+  assert.equal(
+    calls.filter((c) => c.method === "PATCH").at(-1).body.lfbw
+      .primaryFallbackUri,
+    null
+  );
+  const before = calls.length;
+  await assert.rejects(
+    client.updatePrimary(
+      uri,
+      DEFAULT_PRIMARY_URI.replace(PK, "03" + "c".repeat(64))
+    ),
+    { code: "INVALID_PRIMARY" }
+  );
+  assert.equal(calls.length, before);
+});
