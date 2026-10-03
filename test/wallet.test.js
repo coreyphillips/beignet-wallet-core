@@ -4143,3 +4143,127 @@ test("the Lightning fee cap never falls below the route the estimate priced", as
   const onchain = await embeddedFixture().client.prepareSend({ request: ADDRESS, amountSats: 2000 });
   assert.equal("estimatedFeeSats" in onchain, false);
 });
+
+test("concurrent ACTIVE and DRAINING reservations preserve authoritative ordinary capacity", async () => {
+  for (const state of ["ACTIVE", "DRAINING"]) {
+    const { client } = embeddedFixture({
+      "/balance": { onchain: 0, lightning: 200000, splicingSats: 0 },
+      "/liquidity": { sendableSats: 190000 },
+      "/channels": [{ ...channel, remoteBalanceSats: 80000, ffor: {
+        state, concurrent: true, concurrentVersion: 2, reservedInboundSats: 20000, unresolvedSlots: 1,
+      } }],
+      "/receive/offline": { maxSats: 0, available: true, reason: null },
+    });
+    const snapshot = await client.snapshot();
+    assert.equal(snapshot.balance.totalSats, 200000);
+    assert.equal(snapshot.balance.availableSats, 190000);
+    assert.equal(snapshot.balance.receivableSats, 80000);
+    assert.equal(snapshot.balance.pendingSats, 0);
+    assert.equal(snapshot.balance.offlineReceivableSats, 0);
+    assert.equal(snapshot.balance.reservedInboundSats, 20000);
+    assert.equal(snapshot.balance.unresolvedOfflineSlots, 1);
+    assert.equal(snapshot.offlineReservations[0].state, state);
+    assert.equal(snapshot.primary.offlineReceiveAvailable, true);
+  }
+});
+test("public wallet records preserve per-primary availability and refusal reasons", async () => {
+  for (const available of [true, false, null]) {
+    const rec = { ...record, lfbw: { ...record.lfbw, offlineReceiveAvailable: available, offlineReceiveReason: available === false ? 'Settlement disabled' : null } };
+    const { client } = embeddedFixture({ "/api/wallets": [rec], "/api/wallets/wallet-1": rec });
+    const [wallet] = await client.listWallets();
+    assert.equal(wallet.lfbw.offlineReceiveAvailable, available);
+    assert.equal(wallet.lfbw.offlineReceiveReason, rec.lfbw.offlineReceiveReason);
+    assert.equal((await client.snapshot()).primary.offlineReceiveAvailable, available);
+  }
+  const { client } = embeddedFixture();
+  const snapshot = await client.snapshot();
+  assert.equal('reservedInboundSats' in snapshot.balance, false);
+  assert.equal('offlineReceiveAvailable' in snapshot.primary, false);
+});
+test("an interrupted offline receive refreshes under its original request ID and concurrent profile", async () => {
+  let attempts = 0;
+  const terms = { available: true, peer: PK, amountSats: 10000, feeSats: 0, concurrentVersion: 2,
+    terms: { feeBaseMsat: 0, feePpm: 0, concurrentVersion: 2 }, expiresAt: NOW + 60000 };
+  const { client, calls } = embeddedFixture({
+    "/api/config": { offlineReceiveAvailable: true },
+    "/receive/quote": terms,
+    "/receive/invoice": () => {
+      if (++attempts === 1) throw Object.assign(Error('Payment round pending'), { code: 'RECEIVE_PENDING' });
+      return { bolt11: INVOICE, paymentHash: HASH, offlineReceive: true, concurrentVersion: 2 };
+    },
+  });
+  const quote = await client.quoteReceive({ amountSats: 10000, mode: 'offline' });
+  await assert.rejects(client.receive(quote), { code: 'RECEIVE_PENDING' });
+  const refreshed = await client.quoteReceive({ amountSats: 10000, mode: 'offline', requestId: quote.id });
+  assert.equal(refreshed.id, quote.id);
+  assert.equal(refreshed.concurrentVersion, 2);
+  assert.equal((await client.receive(refreshed)).offlineReceive, true);
+  assert.ok(calls.filter(c => c.path === '/receive/quote').every(c => c.query.includes(`requestId=${quote.id}`)));
+  assert.ok(calls.filter(c => c.path === '/receive/invoice').every(c => c.body.requestId === quote.id));
+  assert.ok(!calls.some(c => ['/invoice/create', '/jit/invoice', '/direct-funding/request'].includes(c.path)));
+});
+
+
+test("offline registration retries keep the original request after a lost acknowledgement", async () => {
+  for (const persisted of [true, false]) {
+    let saved;
+    let attempted;
+    let saves = 0;
+    const { client, calls } = embeddedFixture({
+      "/api/config": { offlineReceiveAvailable: true },
+      "/receive/quote": { available: true, peer: PK, amountSats: 10000, concurrentVersion: 2, expiresAt: NOW + 60000 },
+      "/receive/invoice": { bolt11: INVOICE, paymentHash: HASH, offlineReceive: true },
+      "GET /receive/requests": () => ({ requests: saved ? [saved] : [] }),
+      "POST /receive/requests": ({ request }) => {
+        if (++saves === 1) {
+          attempted = { ...request, createdAt: NOW };
+          if (persisted) saved = attempted;
+          throw Error("Connection lost");
+        }
+        const { createdAt, ...original } = attempted;
+        assert.deepEqual(request, original);
+        saved = { ...request, createdAt: NOW };
+        return { request: saved };
+      },
+    });
+    // The entire accepted request ID range must round-trip through storage.
+    const quote = await client.quoteReceive({ amountSats: 10000, description: "Same invoice", mode: "offline", requestId: "r".repeat(160) });
+    await assert.rejects(client.receive(quote), { code: "REQUEST_SAVE_FAILED" });
+    await assert.rejects(client.quoteReceive({ amountSats: 10000, description: "Changed", mode: "offline", requestId: quote.id }), { code: "INVALID_REVIEW" });
+    const refreshed = await client.quoteReceive({ amountSats: 10000, description: "Same invoice", mode: "offline", requestId: quote.id });
+    const recovered = await client.receive(refreshed);
+    assert.equal(recovered.id, quote.id);
+    assert.equal(recovered.uri, attempted.uri);
+    assert.equal(calls.filter(c => c.path === "/address/new").length, 1);
+    assert.equal(calls.filter(c => c.path === "/receive/invoice").length, 2);
+  }
+});
+
+
+test("offline registration recovery refuses expired or closing invoices", async () => {
+  for (const persisted of [true, false]) {
+    for (const expired of [true, false]) {
+      let saved;
+      let closing = false;
+      const { client, setNow } = embeddedFixture({
+        "/api/config": { offlineReceiveAvailable: true },
+        "/receive/quote": { available: true, peer: PK, amountSats: 10000, concurrentVersion: 2, expiresAt: NOW + 3600000 },
+        "/receive/invoice": () => {
+          if (closing) throw Object.assign(Error("The reservation is closing"), { code: "RECEIVE_UNAVAILABLE" });
+          return { bolt11: INVOICE, paymentHash: HASH, offlineReceive: true };
+        },
+        "GET /receive/requests": () => ({ requests: saved ? [saved] : [] }),
+        "POST /receive/requests": ({ request }) => {
+          if (persisted) saved = { ...request, createdAt: NOW };
+          throw Error("Connection lost");
+        },
+      });
+      const quote = await client.quoteReceive({ amountSats: 10000, mode: "offline" });
+      await assert.rejects(client.receive(quote), { code: "REQUEST_SAVE_FAILED" });
+      if (expired) setNow(NOW + 3600001);
+      else closing = true;
+      const refreshed = await client.quoteReceive({ amountSats: 10000, mode: "offline", requestId: quote.id });
+      await assert.rejects(client.receive(refreshed), { code: expired ? "INVOICE_EXPIRED" : "RECEIVE_UNAVAILABLE" });
+    }
+  }
+});
