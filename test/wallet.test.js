@@ -3786,6 +3786,8 @@ test("embedded receiving prepares an offline invoice and preserves its coverage 
   assert.equal(request.offlineReceive,true);
   const create=calls.find(c=>c.path==="/receive/invoice");
   assert.deepEqual(create.body.quote,terms);assert.equal(create.body.requestId,quote.id);
+  assert.equal(create.body.peer, PK);
+  assert.equal(new URLSearchParams(calls.find(c => c.path === "/receive/quote").query).get("peer"), PK);
   assert.ok(!calls.some(c=>["/invoice/create","/jit/invoice","/direct-funding/request"].includes(c.path)));
 });
 test("unsupported offline provider never silently downgrades to an online-only invoice",async()=>{
@@ -4236,6 +4238,7 @@ test("offline registration retries keep the original request after a lost acknow
     assert.equal(recovered.uri, attempted.uri);
     assert.equal(calls.filter(c => c.path === "/address/new").length, 1);
     assert.equal(calls.filter(c => c.path === "/receive/invoice").length, 2);
+    assert.ok(calls.filter(c => c.path === "/receive/invoice").every(c => c.body.peer === PK));
   }
 });
 
