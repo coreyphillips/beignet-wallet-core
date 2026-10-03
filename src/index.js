@@ -132,6 +132,15 @@ export function validatePrimaryUri(input) {
     throw new WalletError(error.message, "INVALID_PRIMARY");
   }
 }
+function validatePrimaryFallback(primaryUri, fallbackUri) {
+  try {
+    return (
+      parsePrimaryFallback(parsePrimaryUri(primaryUri), fallbackUri)?.uri || null
+    );
+  } catch (error) {
+    throw new WalletError(error.message, "INVALID_PRIMARY");
+  }
+}
 export function normalizeConnection(connection) {
   let url;
   try {
@@ -2879,8 +2888,7 @@ export class WalletClient {
   async updatePrimary(uri, fallbackUri) {
     const epoch = this._epoch;
     const primaryUri = validatePrimaryUri(uri);
-    const primaryFallbackUri =
-      parsePrimaryFallback(parsePrimaryUri(primaryUri), fallbackUri)?.uri || null;
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
     const rec = await this._record();
     this._assertEpoch(epoch);
     const result = await this._request(
@@ -2894,7 +2902,9 @@ export class WalletClient {
           trusted: true,
           initialChannelSats: 0,
         },
-        ...(primaryUri.includes(".onion:") ? { tor: true } : {}),
+        ...(primaryUri.includes(".onion:") || primaryFallbackUri
+          ? { tor: true }
+          : {}),
       },
     );
     this._sendReviews.clear();
@@ -3229,8 +3239,7 @@ export class DemoWalletClient {
   }
   async updatePrimary(uri, fallbackUri) {
     const primaryUri = validatePrimaryUri(uri);
-    const primaryFallbackUri =
-      parsePrimaryFallback(parsePrimaryUri(primaryUri), fallbackUri)?.uri;
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
     this.wallet.lfbw.primaryUri = primaryUri;
     this.wallet.lfbw.primaryFallbackUri = primaryFallbackUri;
     return clone(this.wallet);

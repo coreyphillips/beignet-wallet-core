@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DemoWalletClient,
   validatePrimaryUri,
   parsePrimaryUri,
   parsePrimaryFallback,
@@ -35,4 +36,15 @@ test("optional fallback requires the same node identity and a valid onion addres
   );
   assert.throws(() => parsePrimaryFallback(primary, `${key}@example.com:9735`));
   assert.equal(parsePrimaryFallback(primary, ""), undefined);
+});
+
+test("fallback errors use INVALID_PRIMARY in preview too and blank means no fallback", async () => {
+  const client = new DemoWalletClient();
+  await assert.rejects(client.updatePrimary(uri, "bad"), {
+    code: "INVALID_PRIMARY",
+  });
+  assert.equal(parsePrimaryFallback(parsePrimaryUri(uri), "   "), undefined);
+  assert.throws(() => validatePrimaryUri(`${key}@h%st\\x:9735`), {
+    code: "INVALID_PRIMARY",
+  });
 });

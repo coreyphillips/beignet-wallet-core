@@ -4285,14 +4285,28 @@ test('primary diagnostics identify Iroh paths and a selected Tor fallback', asyn
 });
 
 
-test('primary update persists and clears same-key Iroh fallback before sending configuration', async () => {
-  const uri = `${PK}@iroh:${'b'.repeat(64)}`;
-  const { client, calls } = fixture({ 'PATCH /api/wallets/wallet-1': record });
+test("primary update persists and clears same-key Iroh fallback before sending configuration", async () => {
+  const uri = `${PK}@iroh:${"b".repeat(64)}`;
+  const { client, calls } = fixture({ "PATCH /api/wallets/wallet-1": record });
   await client.updatePrimary(uri, DEFAULT_PRIMARY_URI);
-  assert.equal(calls.find(c => c.method === 'PATCH').body.lfbw.primaryFallbackUri, DEFAULT_PRIMARY_URI);
+  assert.equal(
+    calls.find((c) => c.method === "PATCH").body.lfbw.primaryFallbackUri,
+    DEFAULT_PRIMARY_URI
+  );
+  assert.equal(calls.find((c) => c.method === "PATCH").body.tor, true);
   await client.updatePrimary(uri);
-  assert.equal(calls.filter(c => c.method === 'PATCH').at(-1).body.lfbw.primaryFallbackUri, null);
+  assert.equal(
+    calls.filter((c) => c.method === "PATCH").at(-1).body.lfbw
+      .primaryFallbackUri,
+    null
+  );
   const before = calls.length;
-  await assert.rejects(client.updatePrimary(uri, DEFAULT_PRIMARY_URI.replace(PK, '03' + 'c'.repeat(64))));
+  await assert.rejects(
+    client.updatePrimary(
+      uri,
+      DEFAULT_PRIMARY_URI.replace(PK, "03" + "c".repeat(64))
+    ),
+    { code: "INVALID_PRIMARY" }
+  );
   assert.equal(calls.length, before);
 });
