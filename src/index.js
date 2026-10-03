@@ -2085,7 +2085,7 @@ export class WalletClient {
         "RECEIVE_UNAVAILABLE",
       );
       requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
-      offlineQuote = await this._get(`/receive/quote?amountSats=${amount}&requestId=${encodeURIComponent(quoteId)}`);
+      offlineQuote = await this._get(`/receive/quote?peer=${encodeURIComponent(rec.lfbw.primaryPubkey)}&amountSats=${amount}&requestId=${encodeURIComponent(quoteId)}`);
       requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
       // A host's daemon answers an amount no channel can hold offline with a
       // direct-funding plan (beignet #925), which would fail verification
@@ -2197,7 +2197,7 @@ export class WalletClient {
         requires(request.expiresAt > this._now(), "The created request has expired. Create a new receive request.", "INVOICE_EXPIRED");
         const invoice = await this._post("/receive/invoice", {
           amountSats: quote.amountSats, description: quote.description, expirySecs: 600,
-          requestId: quote.id, quote: held.offlineQuote,
+          peer: held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote,
         });
         this._assertEpoch(epoch);
         requires(invoice?.offlineReceive === true && invoice.bolt11 === request.bolt11 && invoice.paymentHash === request.paymentHash,
@@ -2251,7 +2251,7 @@ export class WalletClient {
       invoice = await this._post(
         held.plan === "offline" ? "/receive/invoice" : held.plan === "jit" ? "/jit/invoice" : "/invoice/create",
         held.plan === "offline"
-          ? { ...body, requestId: quote.id, quote: held.offlineQuote }
+          ? { ...body, peer: held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote }
           : held.plan === "jit"
           ? {
               ...body,
