@@ -235,7 +235,7 @@ function publicStoredRequest(value) {
   requires(
     value &&
       typeof value.id === "string" &&
-      value.id.length <= 128 &&
+      value.id.length <= 160 &&
       typeof value.uri === "string" &&
       value.uri.length <= 24000 &&
       typeof value.bolt11 === "string" &&
@@ -641,6 +641,24 @@ function publicSetupError(value) {
     return "The primary node does not support a required wallet feature. Check the selected primary, then retry setup.";
   return "Primary setup could not complete. Check the node address and connection settings, then retry setup.";
 }
+function publicOfflineAvailability(value) {
+  const available = value?.offlineReceiveAvailable;
+  return {
+    ...(available === true || available === false || available === null
+      ? { offlineReceiveAvailable: available } : {}),
+    ...(typeof value?.offlineReceiveReason === "string" || value?.offlineReceiveReason === null
+      ? { offlineReceiveReason: value.offlineReceiveReason === null ? null : value.offlineReceiveReason.slice(0, 512) } : {}),
+  };
+}
+function publicReservation(value) {
+  if (!value || typeof value.concurrent !== "boolean" || typeof value.state !== "string"
+      || !Number.isSafeInteger(value.reservedInboundSats) || value.reservedInboundSats < 0
+      || !Number.isSafeInteger(value.unresolvedSlots) || value.unresolvedSlots < 0
+      || (value.concurrent && ![1, 2].includes(value.concurrentVersion))) return undefined;
+  return { state: value.state, concurrent: value.concurrent,
+    ...(value.concurrent ? { concurrentVersion: value.concurrentVersion } : {}),
+    reservedInboundSats: value.reservedInboundSats, unresolvedSlots: value.unresolvedSlots };
+}
 function publicWallet(rec) {
   if (!rec?.id)
     throw new WalletError(
@@ -664,6 +682,7 @@ function publicWallet(rec) {
             setup: rec.lfbw.setup,
             ...(setupError ? { setupError } : {}),
             trusted: rec.lfbw.trusted,
+            ...publicOfflineAvailability(rec.lfbw),
             ...(rec.lfbw.unpairedFunding &&
             Number.isFinite(rec.lfbw.unpairedFunding.at)
               ? { unpairedFunding: { at: rec.lfbw.unpairedFunding.at } }
@@ -1451,6 +1470,15 @@ export class WalletClient {
           `${this.connection.walletId}:${payment.paymentHash}`,
         );
     const wallet = publicWallet(rec);
+    const reservations = channels.flatMap((channel) => {
+      const reservation = publicReservation(channel.ffor);
+      return reservation ? [{ channelId: text(channel.channelId), ...reservation }] : [];
+    });
+    const reportedReservations = reservations.length > 0;
+    const offlineAvailability = publicOfflineAvailability({
+      offlineReceiveAvailable: offline?.available !== undefined ? offline.available : wallet.lfbw?.offlineReceiveAvailable,
+      offlineReceiveReason: offline?.reason !== undefined ? offline.reason : wallet.lfbw?.offlineReceiveReason,
+    });
     const rows = [...activity, ...local].sort(
       (a, b) => b.timestamp - a.timestamp,
     );
@@ -1464,15 +1492,21 @@ export class WalletClient {
         pendingSats: integerField(pendingSats, "pending balance"),
         pending,
         receivableSats: integerField(status.canReceive, "receivable balance"),
+        ...(reportedReservations ? {
+          reservedInboundSats: reservations.reduce((sum, r) => sum + r.reservedInboundSats, 0),
+          unresolvedOfflineSlots: reservations.reduce((sum, r) => sum + r.unresolvedSlots, 0),
+        } : {}),
         ...(Number.isSafeInteger(offline?.maxSats) && offline.maxSats >= 0
           ? { offlineReceivableSats: offline.maxSats }
           : {}),
       },
       activity: rows,
+      ...(reportedReservations ? { offlineReservations: reservations } : {}),
       primary: {
         uri: text(rec.lfbw.primaryUri),
         connected: status.primaryConnected,
         setup: rec.lfbw.setup || "pending",
+        ...offlineAvailability,
         ...(wallet.lfbw?.setupError
           ? { setupError: wallet.lfbw.setupError }
           : {}),
@@ -2003,10 +2037,18 @@ export class WalletClient {
       ...(result.txid ? { txid: result.txid } : {}),
     });
   }
-  async quoteReceive({ amountSats, description, mode } = {}) {
+  async quoteReceive({ amountSats, description, mode, requestId } = {}) {
     validateReceiveMode(mode);
+    requires(requestId === undefined || (mode === "offline" && typeof requestId === "string" && /^[a-zA-Z0-9_-]{16,160}$/.test(requestId)),
+      "A valid offline request ID is required.", "INVALID_PARAMS");
+    const quoteId = requestId ?? uid();
+    const previous = this._receiveQuotes.get(quoteId);
+    requires(!previous?.inFlight, "This request is still being prepared.", "RECEIVE_BUSY");
     const epoch = this._epoch;
     const amount = amountOptional(amountSats);
+    const requestedDescription = boundedDescription(description);
+    requires(!previous || (previous.walletId === this.connection.walletId && previous.plan === "offline" && previous.quote.amountSats === amount && previous.quote.description === requestedDescription),
+      "This request ID belongs to a different payment request.", "INVALID_REVIEW");
     const rec = await this._record();
     const [channels, peers] = await Promise.all([
       this._get("/channels"),
@@ -2043,14 +2085,14 @@ export class WalletClient {
         "RECEIVE_UNAVAILABLE",
       );
       requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
-      offlineQuote = await this._get(`/receive/quote?amountSats=${amount}`);
+      offlineQuote = await this._get(`/receive/quote?amountSats=${amount}&requestId=${encodeURIComponent(quoteId)}`);
       requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
       // A host's daemon answers an amount no channel can hold offline with a
       // direct-funding plan (beignet #925), which would fail verification
       // after the review. Refuse it here instead.
       requires(
         offlineQuote.mode !== "direct-funding",
-        "No channel can hold an offline receive right now. It needs a channel with your primary node that holds none of your balance. Turn off Receive offline to create an ordinary payment request.",
+        "No channel can hold an offline receive right now. It needs remaining inbound capacity on an eligible channel with your primary node. Turn off Receive offline to create an ordinary payment request.",
         "RECEIVE_UNAVAILABLE",
       );
       plan = { kind: "offline" };
@@ -2108,13 +2150,14 @@ export class WalletClient {
     }
     this._assertEpoch(epoch);
     const quote = {
-      id: uid(),
+      id: quoteId,
       amountSats: amount,
       description: boundedDescription(description),
       feeSats,
       netSats: amount == null ? null : amount - feeSats,
       expiresAt: this._now() + 60000,
       warnings,
+      ...(mode === "offline" ? { mode: "offline", ...(offlineQuote.concurrentVersion ? { concurrentVersion: offlineQuote.concurrentVersion } : {}) } : {}),
     };
     this._receiveQuotes.set(quote.id, {
       quote: clone(quote),
@@ -2123,6 +2166,7 @@ export class WalletClient {
       rec,
       feePolicy,
       offlineQuote,
+      ...(previous?.walletId === this.connection.walletId && previous.plan === "offline" ? { preparedRequest: previous.preparedRequest } : {}),
     });
     return quote;
   }
@@ -2144,7 +2188,42 @@ export class WalletClient {
       "The receive quote expired. Review the request again.",
       "QUOTE_EXPIRED",
     );
-    this._receiveQuotes.delete(quote.id);
+    requires(!held.inFlight, "This request is still being prepared.", "RECEIVE_BUSY");
+    held.inFlight = true;
+    if (held.plan !== "offline") this._receiveQuotes.delete(quote.id);
+    try {
+    if (held.plan === "offline") {
+      const validateRetry = async request => {
+        requires(request.expiresAt > this._now(), "The created request has expired. Create a new receive request.", "INVOICE_EXPIRED");
+        const invoice = await this._post("/receive/invoice", {
+          amountSats: quote.amountSats, description: quote.description, expirySecs: 600,
+          requestId: quote.id, quote: held.offlineQuote,
+        });
+        this._assertEpoch(epoch);
+        requires(invoice?.offlineReceive === true && invoice.bolt11 === request.bolt11 && invoice.paymentHash === request.paymentHash,
+          "The saved payment request could not be verified. Check Activity before sharing it.", "INVALID_RESPONSE");
+      };
+      const existing = await this._get("/receive/requests");
+      this._assertEpoch(epoch);
+      requires(Array.isArray(existing?.requests), "Stored receive requests could not be read. Reconnect before retrying.", "INVALID_RESPONSE");
+      const saved = existing.requests.find(request => request.id === quote.id);
+      if (saved) {
+        requires(saved.offlineReceive === true && saved.amountSats === quote.amountSats && boundedDescription(saved.description) === quote.description,
+          "This request ID belongs to a different payment request.", "INVALID_REVIEW");
+        const result = publicStoredRequest(saved);
+        await validateRetry(result);
+        this._receiveQuotes.delete(quote.id);
+        return result;
+      }
+      if (held.preparedRequest) {
+        await validateRetry(held.preparedRequest);
+        const saved = await this._post("/receive/requests", { request: held.preparedRequest });
+        this._assertEpoch(epoch);
+        const result = publicStoredRequest(saved?.request);
+        this._receiveQuotes.delete(quote.id);
+        return result;
+      }
+    }
     const amount = quote.amountSats;
     let address;
     let lightningOnly = false;
@@ -2298,10 +2377,13 @@ export class WalletClient {
       warnings,
       demo: false,
     };
+    if (held.plan === "offline") held.preparedRequest = clone(request);
     try {
       const saved = await this._post("/receive/requests", { request });
       this._assertEpoch(epoch);
-      return publicStoredRequest(saved?.request);
+      const result = publicStoredRequest(saved?.request);
+      this._receiveQuotes.delete(quote.id);
+      return result;
     } catch (error) {
       if (error?.code === "WALLET_CHANGED") throw error;
       throw new WalletError(
@@ -2309,6 +2391,9 @@ export class WalletClient {
         "REQUEST_SAVE_FAILED",
         error?.status,
       );
+    }
+    } finally {
+      held.inFlight = false;
     }
   }
   async importReceiveRequest(uri, expectedPaymentHash) {

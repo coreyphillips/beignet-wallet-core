@@ -25,6 +25,8 @@ export interface WalletRecord {
     /** Safe user-facing diagnostic; raw engine messages are never exposed. */
     setupError?: string;
     trusted?: boolean;
+    offlineReceiveAvailable?: boolean | null;
+    offlineReceiveReason?: string | null;
     /** A payer this wallet has not paired with is growing the home channel; the splice locks at depth. */
     unpairedFunding?: { at: number };
     /** The home channel's last splice conflict or revert, while it is worth telling. */
@@ -104,12 +106,18 @@ export interface WalletSnapshot {
      * hold one. Absent when the engine does not say (a host's daemon).
      */
     offlineReceivableSats?: number;
+    /** Already reserved inbound, informational and never subtracted from availableSats. */
+    reservedInboundSats?: number;
+    unresolvedOfflineSlots?: number;
   };
+  offlineReservations?: OfflineReservation[];
   activity: Activity[];
   primary: {
     uri: string;
     connected: boolean;
     setup: string;
+    offlineReceiveAvailable?: boolean | null;
+    offlineReceiveReason?: string | null;
     /** Safe user-facing diagnostic; absent when setup has no recorded error. */
     setupError?: string;
   };
@@ -150,7 +158,17 @@ export interface SendResult {
   paymentHash?: string;
   message: string;
 }
+export interface OfflineReservation {
+  channelId: string;
+  state: string;
+  concurrent: boolean;
+  concurrentVersion?: 1 | 2;
+  reservedInboundSats: number;
+  unresolvedSlots: number;
+}
 export interface ReceiveInput {
+  /** Refresh an interrupted offline request without changing its identity or profile. */
+  requestId?: string;
   amountSats?: number | string | null;
   description?: string;
   /**
@@ -162,6 +180,8 @@ export interface ReceiveInput {
   mode?: "unified" | "offline";
 }
 export interface ReceiveQuote {
+  mode?: "offline";
+  concurrentVersion?: 1 | 2;
   id: string;
   amountSats: number | null;
   description: string;
@@ -233,6 +253,7 @@ export interface HostConfig {
   torAvailable: boolean;
   lfbwAvailable: boolean;
   offlineReceiveAvailable?: boolean;
+  concurrentOfflineReceiveAvailable?: boolean;
   jitQuoteAvailable?: boolean;
   recoveryAvailable?: boolean;
   recoveryAutoApplyAvailable?: boolean;
