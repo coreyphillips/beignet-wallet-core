@@ -66,6 +66,7 @@ export interface Activity {
   feeSats: number;
   feeKnown?: boolean;
   feeEstimated?: boolean;
+  payAll?: PayAllAmounts;
   status: PaymentStatus;
   timestamp: number;
   reference: string;
@@ -130,6 +131,22 @@ export interface WalletSnapshot {
 export interface SendInput {
   request: string;
   amountSats?: number | string | null;
+  max?: boolean;
+}
+export type KeptReason = "none" | "reserve" | "commitment-cost" | "unavailable";
+export interface MaxQuote {
+  /** A pay-all recipient minimum, or the resolved address output. No review is held. */
+  amountSats: number;
+  keptSats: number;
+  keptReason: KeptReason;
+}
+export interface PayAllAmounts {
+  /** Exact decimal millisatoshis. These strings must never pass through Number. */
+  debitMsat: string;
+  maxFeeMsat: string;
+  deliveredMsat: string;
+  feeMsat: string;
+  remainderMsat: string;
 }
 export interface SendReview {
   id: string;
@@ -141,8 +158,17 @@ export interface SendReview {
   feeLabel: string;
   /** Lightning only: the fee of the route that was priced, usually what is paid. */
   estimatedFeeSats?: number;
-  /** amountSats + feeSats: the most this payment can cost. */
+  /** The most this payment can cost. Pay-all uses the debit ceiling rounded up. */
   totalSats: number;
+  max?: true;
+  keptSats?: number;
+  keptReason?: KeptReason;
+  /** Pay-all bounds are independent facts, not a sum of rounded amounts. */
+  minRecipientSats?: number;
+  maxFeeSats?: number;
+  debitSats?: number;
+  debitMsat?: string;
+  maxFeeMsat?: string;
   route: "lightning" | "bitcoin";
   /** Present when a Bitcoin route pays a direct-funding request instead of the address. */
   method?: "direct-funding";
@@ -156,6 +182,7 @@ export interface SendResult {
   feeSats: number;
   feeKnown?: boolean;
   feeEstimated?: boolean;
+  payAll?: PayAllAmounts;
   txid?: string;
   paymentHash?: string;
   message: string;
@@ -348,6 +375,7 @@ export interface WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
+  quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
@@ -398,6 +426,7 @@ export class WalletClient implements WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
+  quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
@@ -424,6 +453,7 @@ export class DemoWalletClient implements WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
+  quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
