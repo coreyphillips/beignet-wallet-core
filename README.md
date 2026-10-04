@@ -78,3 +78,11 @@ The runtime accepts `request({method,path,body})` and returns raw command result
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Emptying a wallet to an address
+
+`prepareDrain({ address })` accepts a network-correct address or an amountless Bitcoin URI when the host advertises `drainAvailable`. It returns a single-use `SendReview` with `method: "drain"`. The `drain` field separates the cooperative-close output and fee from the loose-coin sweep output and fee. The review itself does not pause receiving or close the channel. An address URI with a requested amount is refused.
+
+`send(review)` submits only the saved drain identity. The portable coordinator owns the durable hold, close, exact-input sweep and recovery. Closing fees are estimates until agreement. Later receipts remain in the wallet. A lost reply is resolved by reading that same identity, never by submitting another request. `getDrain(requestId)` reports current progress; `cancelDrain(requestId)` succeeds only while the coordinator can prove the close has not started.
+
+A drain is one durable Activity row, including while pending or uncertain, with both transaction IDs in `activity.drain.txids`. Component transaction rows are folded into it. Authoritative shallow-reorg progress can move that row back to pending without deleting its history. Balance continues to come from the engine. Supply the app's `ActivityStore` to retain this row across client restarts.

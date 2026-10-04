@@ -4616,3 +4616,257 @@ test("send max retained commitment cost stays in total and out of available bala
   assert.equal(balance.availableSats, 0);
   assert.equal(balance.pendingSats, 0);
 });
+
+function drainFixture(overrides = {}, options = {}) {
+  let progress;
+  const base = (requestId, address) => ({ requestId, address, revision: 1, phase: 'review',
+    amountSats: 11200, feeSats: 800, debitSats: 12000, reviewedDebitSats: 12000,
+    closeAmountSats: 9500, closeFeeSats: 500, sweepAmountSats: 1700, sweepFeeSats: 300,
+    feeEstimated: true, txids: [], createdAt: NOW, expiresAt: NOW + 120000 });
+  const f = fixture({
+    '/api/config': { drainAvailable: true },
+    '/drain/quote': ({requestId, address}) => (progress = base(requestId, address)),
+    '/drain/send': ({requestId}) => {
+      assert.equal(requestId, progress.requestId);
+      progress = {...progress, revision: progress.revision + 1, phase: 'pending', feeEstimated: false, startedAt: NOW,
+        txids: ['cd'.repeat(32), 'ef'.repeat(32)]};
+      return progress;
+    },
+    '/drain': () => progress,
+    '/drain/cancel': () => (progress = {...progress, revision: progress.revision + 1, phase: 'cancelled'}),
+    ...overrides,
+  }, options);
+  return { ...f, base, get progress() { return progress; }, set progress(next) { progress = next; } };
+}
+
+test('drain review binds both components and a destination without starting the drain', async () => {
+  const f = drainFixture();
+  const before = (await f.client.snapshot()).balance;
+  const review = await f.client.prepareDrain({address: `bitcoin:${ADDRESS}`});
+  assert.equal(review.method, 'drain');
+  assert.equal(review.destination, ADDRESS);
+  assert.equal(review.amountSats, 11200);
+  assert.equal(review.feeSats, 800);
+  assert.equal(review.totalSats, 12000);
+  assert.deepEqual((await f.client.snapshot()).balance, before);
+  assert.deepEqual(f.calls.filter(c => c.path.startsWith('/drain')).map(c => c.path), ['/drain/quote']);
+  assert.equal(review.drain.closeAmountSats, 9500);
+  assert.equal(review.drain.sweepAmountSats, 1700);
+});
+
+test('drain refuses fixed amounts, Lightning and wrong-network addresses before quote', async () => {
+  const f = drainFixture();
+  for (const address of [`bitcoin:${ADDRESS}?amount=0.001`, INVOICE,
+    bech32Encode('bcrt', [0, ...convertBits(new Array(20).fill(7), 8, 5, true)])]) {
+    await assert.rejects(f.client.prepareDrain({address}));
+  }
+  assert.equal(f.calls.some(c => c.path === '/drain/quote'), false);
+  const old = drainFixture({'/api/config': {}});
+  await assert.rejects(old.client.prepareDrain({address: ADDRESS}), {code: 'DRAIN_UNAVAILABLE'});
+});
+
+test('drain rejects changed, expired and already-used reviews', async () => {
+  const f = drainFixture();
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  await assert.rejects(f.client.send({...review, destination: ADDRESS + 'x'}), {code: 'REVIEW_CHANGED'});
+  f.setNow(NOW + 120001);
+  await assert.rejects(f.client.send(review), {code: 'QUOTE_EXPIRED'});
+  assert.equal(f.calls.some(c => c.path === '/drain/send'), false);
+  f.setNow(NOW);
+  const sent = await f.client.send(review);
+  assert.equal(sent.status, 'pending');
+  await assert.rejects(f.client.send(review), {code: 'INVALID_REVIEW'});
+  assert.equal(f.calls.filter(c => c.path === '/drain/send').length, 1);
+});
+
+test('drain rejects another quote identity and inconsistent component amounts', async () => {
+  for (const patch of [{requestId: 'another-drain-001'}, {sweepAmountSats: 1701}]) {
+    const f = drainFixture({'/drain/quote': ({requestId, address}) => ({...f.base(requestId, address), ...patch})});
+    await assert.rejects(f.client.prepareDrain({address: ADDRESS}));
+    assert.equal(f.calls.some(c => c.path === '/drain/send'), false);
+  }
+});
+
+test('drain resolves a lost submit reply by identity without submitting again', async () => {
+  const f = drainFixture({'/drain/send': () => {
+    f.progress = {...f.progress, phase: 'closing', startedAt: NOW};
+    throw new Error('reply lost');
+  }});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  const result = await f.client.send(review);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.drain.phase, 'closing');
+  assert.equal(f.calls.filter(c => c.path === '/drain/send').length, 1);
+  assert.equal(f.calls.filter(c => c.path === '/drain').length, 1);
+});
+
+test('drain unknown outcome survives restart and reconciles without a second submit', async () => {
+  let saved = [];
+  const store = {load: () => saved, save: (_id, rows) => {saved = structuredClone(rows);}};
+  const f = drainFixture({'/drain/send': new Error('disconnected'), '/drain': new Error('disconnected')}, {store});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  assert.equal((await f.client.send(review)).status, 'uncertain');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].status, 'uncertain');
+  const next = drainFixture({'/drain': () => ({...f.progress, phase: 'closing'})}, {store});
+  const snapshot = await next.client.snapshot();
+  assert.equal(snapshot.activity.filter(row => row.drain).length, 1);
+  assert.equal(snapshot.activity.find(row => row.drain).status, 'pending');
+  assert.equal(next.calls.some(c => c.path === '/drain/send'), false);
+});
+
+test('drain cancellation updates the durable row and consumes the review', async () => {
+  let saved = [];
+  const store = {load: () => saved, save: (_id, rows) => {saved = structuredClone(rows);}};
+  const f = drainFixture({'/drain/send': () => (f.progress = {...f.progress, phase: 'preparing'})}, {store});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  await f.client.send(review);
+  const cancelled = await f.client.cancelDrain(review.id);
+  assert.equal(cancelled.phase, 'cancelled');
+  assert.equal(saved[0].status, 'failed');
+  const restarted = drainFixture({}, {store});
+  assert.equal((await restarted.client.snapshot()).activity.find(row => row.drain).status, 'failed');
+  await assert.rejects(f.client.send(review), {code: 'INVALID_REVIEW'});
+});
+
+test('drain keeps both txids in one durable send across pruning and a shallow reorg', async () => {
+  let saved = [], journal = [];
+  const txids = ['cd'.repeat(32), 'ef'.repeat(32)];
+  const store = {load: () => saved, save: (_id, rows) => {saved = structuredClone(rows);}};
+  const overrides = {
+    '/transactions': txids.map((txid, i) => ({txid, type: 'sent', valueSats: i ? 1700 : 9500, feeSats: i ? 300 : 500, confirmed: true, timestamp: NOW})),
+    '/api/wallets/wallet-1/activity': () => journal,
+  };
+  const f = drainFixture(overrides, {store});
+  await f.client.snapshot(); // Both engine leg rows were visible before the coordinator returned.
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  await f.client.send(review);
+  journal = [{id: `drain:${review.id}`, title: 'Wallet emptied', amountSats: 11200, feeSats: 800,
+    status: 'completed', timestamp: NOW, reference: review.id, txid: txids[0], address: ADDRESS,
+    drain: {...f.progress, revision: 3, phase: 'completed'}}];
+  let snapshot = await f.client.snapshot();
+  assert.equal(snapshot.activity.length, 1);
+  assert.deepEqual(snapshot.activity[0].drain.txids, txids);
+  assert.equal(saved.length, 1);
+  journal = [{...journal[0], status: 'pending', drain: {...journal[0].drain, revision: 4, phase: 'pending'}}];
+  snapshot = await f.client.snapshot();
+  assert.equal(snapshot.activity.length, 1);
+  assert.equal(snapshot.activity[0].status, 'pending');
+  journal = [];
+  const next = drainFixture(overrides, {store});
+  snapshot = await next.client.snapshot();
+  assert.equal(snapshot.activity.length, 1);
+  assert.equal(snapshot.activity[0].status, 'pending');
+  assert.deepEqual(snapshot.activity[0].drain.txids, txids);
+});
+
+test('drain records actual component fees and leaves balance reporting to the engine', async () => {
+  const f = drainFixture({'/drain/send': () => ({...f.progress, phase: 'pending',
+    amountSats: 11300, feeSats: 700, closeAmountSats: 9600, closeFeeSats: 400})});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  const before = (await f.client.snapshot()).balance;
+  const result = await f.client.send(review);
+  assert.equal(result.amountSats, 11300);
+  assert.equal(result.feeSats, 700);
+  assert.equal(result.drain.reviewedDebitSats, 12000);
+  assert.deepEqual((await f.client.snapshot()).balance, before);
+});
+
+test('drain lookup after a lost reply stays tied to the submitted wallet', async () => {
+  let finish, savedWallet;
+  const f = drainFixture({'/drain/send': () => new Promise((_resolve, reject) => {finish = reject;})},
+    {store: {load: () => [], save: (walletId) => {savedWallet = walletId;}}});
+  const urls = [];
+  const fetch = f.client._fetch;
+  f.client._fetch = (url, options) => { urls.push(url); return fetch(url, options); };
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  const pending = f.client.send(review);
+  await new Promise(resolve => setImmediate(resolve));
+  f.client.selectWallet('wallet-2');
+  f.progress = {...f.progress, phase: 'closing'};
+  finish(new Error('lost reply'));
+  await assert.rejects(pending, {code: 'WALLET_CHANGED'});
+  assert.equal(savedWallet, 'wallet-1');
+  assert.ok(urls.find(url => url.includes('/wallets/wallet-1/api/drain?')));
+  assert.equal(urls.some(url => url.includes('/wallets/wallet-2/api/drain')), false);
+});
+
+test('demo drain uses the same review and pending activity contract', async () => {
+  const client = new DemoWalletClient();
+  assert.equal((await client.getConfig()).drainAvailable, true);
+  const review = await client.prepareDrain({address: ADDRESS});
+  const sent = await client.send(review);
+  assert.equal(sent.drain.txids.length, 2);
+  assert.equal(sent.status, 'pending');
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.totalSats, 0);
+  assert.equal(snapshot.activity.filter(row => row.drain).length, 1);
+  assert.deepEqual(await client.getDrain(review.id), sent.drain);
+  await assert.rejects(client.cancelDrain(review.id), {code: 'DRAIN_ALREADY_COMMITTED'});
+});
+
+test('drain stays uncertain when a lost submit reply is followed by the old review state', async () => {
+  let saved = [];
+  const f = drainFixture({'/drain/send': new Error('reply lost')},
+    {store: {load: () => [], save: (_id, rows) => {saved = structuredClone(rows);}}});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  const outcome = await f.client.send(review);
+  assert.equal(outcome.status, 'uncertain');
+  assert.equal(saved[0].status, 'uncertain');
+  assert.equal(saved[0].title, 'Emptying wallet');
+  f.progress = {...f.progress, revision: 2, phase: 'closing'};
+  assert.equal((await f.client.snapshot()).activity.find(row => row.drain).status, 'pending');
+});
+
+test('drain revisions prevent an older snapshot from losing completed facts or a txid', async () => {
+  let saved = [], journal = [];
+  const f = drainFixture({'/api/wallets/wallet-1/activity': () => structuredClone(journal)},
+    {store: {load: () => saved, save: (_id, rows) => {saved = structuredClone(rows);}}});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  const first = {...f.progress, revision: 2, phase: 'closing', txids: ['cd'.repeat(32)]};
+  const row = progress => ({id: `drain:${review.id}`, title: 'Emptying wallet', amountSats: progress.amountSats,
+    feeSats: progress.feeSats, status: progress.phase === 'completed' ? 'completed' : 'pending',
+    timestamp: NOW, reference: review.id, txid: progress.txids[0], drain: progress});
+  journal = [row(first)];
+  let release, entered;
+  const held = new Promise(resolve => {entered = resolve;});
+  const reconcile = f.client._reconcileReceiveActivity.bind(f.client);
+  let once = true;
+  f.client._reconcileReceiveActivity = async args => {
+    if (once) {once = false; entered(); await new Promise(resolve => {release = resolve;});}
+    return reconcile(args);
+  };
+  const older = f.client.snapshot();
+  await held;
+  const latest = {...first, revision: 3, phase: 'completed', txids: ['cd'.repeat(32), 'ef'.repeat(32)]};
+  journal = [row(latest)];
+  assert.equal((await f.client.snapshot()).activity[0].status, 'completed');
+  release();
+  const late = await older;
+  assert.equal(late.activity[0].status, 'completed');
+  assert.deepEqual(late.activity[0].drain.txids, latest.txids);
+  assert.equal(saved[0].status, 'completed');
+  assert.deepEqual(saved[0].drain.txids, latest.txids);
+  journal = [row({...latest, revision: 4, phase: 'pending'})];
+  assert.equal((await f.client.snapshot()).activity[0].status, 'pending');
+});
+
+test('drain deduplicates an overlapping snapshot against the final durable ledger', async () => {
+  const txids = ['cd'.repeat(32), 'ef'.repeat(32)];
+  const f = drainFixture({'/transactions': txids.map((txid, i) => ({txid, type: 'sent',
+    valueSats: i ? 1700 : 9500, feeSats: i ? 300 : 500, confirmed: true, timestamp: NOW}))});
+  const review = await f.client.prepareDrain({address: ADDRESS});
+  let release, entered;
+  const held = new Promise(resolve => {entered = resolve;});
+  const reconcile = f.client._reconcileReceiveActivity.bind(f.client);
+  f.client._reconcileReceiveActivity = async args => {
+    entered(); await new Promise(resolve => {release = resolve;}); return reconcile(args);
+  };
+  const reading = f.client.snapshot();
+  await held;
+  await f.client.send(review);
+  release();
+  const snapshot = await reading;
+  assert.equal(snapshot.activity.length, 1);
+  assert.deepEqual(snapshot.activity[0].drain.txids, txids);
+});

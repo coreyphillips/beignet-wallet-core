@@ -43,6 +43,11 @@ async function verifyContract(
   void restored;
   void receiveStatus;
   const review = await client.prepareSend({ request: receive.uri });
+  const drainReview = await client.prepareDrain({ address: receive.address! });
+  const drainProgress = await client.getDrain(drainReview.id);
+  const cancelledDrain = await client.cancelDrain(drainReview.id);
+  void drainProgress;
+  void cancelledDrain;
   const maximum = await client.quoteMax({ request: receive.uri });
   const kept: number = maximum.keptSats;
   const maxReview = await client.prepareSend({ request: receive.uri, max: true });
