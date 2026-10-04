@@ -16,6 +16,12 @@ const result = await wallet.send(review);
 
 `DemoWalletClient` is an explicitly selected, isolated in-memory preview. It never calls `fetch`, and its receive QR is deliberately non-payable. `demo` and `demo:coffee` are sample send inputs in preview only.
 
+`quoteMax({ request })` returns the amount for a max chip and the channel balance kept, with its reason. It holds no review. `prepareSend({ request, max: true })` obtains a fresh quote and binds it to a single send. Fixed-amount requests refuse with `MAX_FIXED_AMOUNT`.
+
+An address max uses its destination's splice quote. An amountless invoice uses pay-all and reviews three independent bounds: `minRecipientSats`, `maxFeeSats`, and `debitSats`. The fee cap uses the daemon's 1% policy with a 50 sat floor, limited to leave at least one sat for the recipient. Displayed recipient amounts round down; fee and debit bounds round up. `debitMsat` and `maxFeeMsat` remain exact decimal strings through dispatch. New receipts never increase that reviewed budget. A smaller budget or a more expensive address quote refuses with `QUOTE_EXPIRED`, so the app must obtain a new review.
+
+Pay-all results and completed activity carry `payAll`, containing the exact `deliveredMsat`, `feeMsat`, `debitMsat`, `maxFeeMsat`, and `remainderMsat`. The result is saved to the activity store before `send` returns when storage is available. A later read without these fields cannot erase them. The channel remains open; `keptReason` distinguishes its reserve, commitment cost, unavailable funds, or no whole sats kept.
+
 ## Payment behavior
 
 - Parse integer sats and decimal Bitcoin amounts without floating-point rounding. The whole-sat UI refuses fractional-sat invoices. Validate request checksums, network, conflicting amounts, required BIP21 parameters and invisible directional controls before requesting a quote.

@@ -102,6 +102,59 @@ const integerField = (value, name) => {
     );
   }
 };
+const msatField = (value, name) => {
+  requires(
+    typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value) &&
+      BigInt(value) <= BigInt(MAX_SATS) * 1000n,
+    `The wallet returned an invalid ${name}. Refresh before continuing.`,
+    "INVALID_RESPONSE",
+  );
+  return BigInt(value);
+};
+const msatFloor = (value) => Number(value / 1000n);
+const msatCeil = (value) => Number((value + 999n) / 1000n);
+function payAllRecord(value) {
+  if (value == null) return undefined;
+  const fields = Object.fromEntries(
+    ["debitMsat", "maxFeeMsat", "deliveredMsat", "feeMsat", "remainderMsat"]
+      .map((key) => [key, msatField(value[key], key)]),
+  );
+  requires(
+    fields.debitMsat > 0n && fields.maxFeeMsat < fields.debitMsat &&
+      fields.feeMsat <= fields.maxFeeMsat &&
+      fields.deliveredMsat + fields.feeMsat + fields.remainderMsat === fields.debitMsat,
+    "The wallet returned inconsistent pay-all amounts. Check Activity before sending again.",
+    "INVALID_RESPONSE",
+  );
+  return Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, value.toString()]));
+}
+function keptBalance(channels, debitSats) {
+  const localSats = channels.reduce(
+    (sum, channel) => sum + integerField(channel.localBalanceSats, "channel balance"), 0,
+  );
+  const keptSats = Math.max(0, localSats - debitSats);
+  const hasReserve = channels.some((channel) => channel.localReserveWaived !== true);
+  const isOpener = channels.some((channel) => channel.isOpener === true);
+  return {
+    keptSats,
+    keptReason: !keptSats ? "none" : hasReserve ? "reserve" : isOpener ? "commitment-cost" : "unavailable",
+  };
+}
+function keepPayAll(row, previous) {
+  return previous?.payAll && !row.payAll
+    ? { ...row, payAll: previous.payAll, amountSats: previous.amountSats,
+      feeSats: previous.feeSats, feeKnown: previous.feeKnown, feeEstimated: previous.feeEstimated }
+    : row;
+}
+function requirePrimary(rec, peers) {
+  const primary = rec.lfbw?.primaryPubkey;
+  requires(
+    !primary || peers.some((peer) => peer.pubkey === primary &&
+      (peer.connected || peer.state === "connected" || peer.state === "ready")),
+    "Your primary node needs to reconnect before this wallet can send. Try again in a minute.",
+    "PRIMARY_DOWN",
+  );
+}
 const amountOptional = (value) =>
   value == null || value === "" ? null : positiveSats(value);
 const text = (value) => (typeof value === "string" ? value : "");
@@ -345,15 +398,17 @@ export function mergeActivity(
     if (!p.paymentHash) continue;
     const kind = p.direction === "INCOMING" ? "received" : "sent";
     const id = `payment:${p.paymentHash}`;
+    const payAll = payAllRecord(p.payAll);
     const next = {
       id,
       kind,
       title: kind === "received" ? "Payment received" : "Payment sent",
       description: text(p.metadata?.description),
-      amountSats: integerField(p.amountSats, "payment amount"),
-      feeSats: p.feeSats == null ? 0 : integerField(p.feeSats, "payment fee"),
-      feeKnown: p.feeSats != null,
-      feeEstimated: false,
+      amountSats: payAll ? msatFloor(BigInt(payAll.deliveredMsat)) : integerField(p.amountSats, "payment amount"),
+      feeSats: payAll ? msatCeil(BigInt(payAll.feeMsat)) : p.feeSats == null ? 0 : integerField(p.feeSats, "payment fee"),
+      feeKnown: !!payAll || p.feeSats != null,
+      ...(payAll ? { payAll } : {}),
+      feeEstimated: !!payAll && activityStatus(p.status) !== "completed",
       status: activityStatus(p.status),
       timestamp: asTime(p.completedAt || p.createdAt),
       reference: p.paymentHash,
@@ -552,6 +607,10 @@ function ledgerRow(raw) {
     if (boundedId(raw.txid)) row.txid = raw.txid;
     if (boundedId(raw.paymentHash)) row.paymentHash = raw.paymentHash.toLowerCase();
     if (boundedId(raw.address)) row.address = raw.address;
+    try {
+      const payAll = payAllRecord(raw.payAll);
+      if (payAll) row.payAll = payAll;
+    } catch { /* Malformed optional data never removes a saved row. */ }
     const receiveRequest = ledgerReceiveRequest(raw.receiveRequest, row.paymentHash);
     if (receiveRequest) row.receiveRequest = receiveRequest;
     const receiveStatus = ledgerReceiveStatus(raw.receiveStatus);
@@ -576,11 +635,12 @@ function ledgerRow(raw) {
 function restoreActivity(known, read) {
   const ids = new Set(read.map((row) => row.id));
   const references = new Set(read.map((row) => row.reference));
-  const rows = read.map((row) =>
-    row.status !== "completed" && known.has(row.id)
-      ? { ...known.get(row.id) }
-      : row,
-  );
+  const byReference = new Map([...known.values()].map((row) => [row.reference, row]));
+  const rows = read.map((row) => {
+    const previous = known.get(row.id) ?? byReference.get(row.reference);
+    if (previous && row.status !== "completed") return { ...previous };
+    return keepPayAll(row, previous);
+  });
   const kept = [...known.values()]
     .filter((row) => !ids.has(row.id) && !references.has(row.reference))
     .map((row) => ({ ...row }));
@@ -761,6 +821,7 @@ const knownRefusal = (error) =>
       "INSUFFICIENT_FUNDS",
       "INVALID_AMOUNT",
       "NO_ROUTE",
+      "PAY_ALL_REMAINDER",
     ].includes(error.code) ||
     DIRECT_FUNDING_REFUSAL_CODES.has(error.code));
 
@@ -786,6 +847,8 @@ export class WalletClient {
     this._store = activityStore(options.store);
     this._ledgers = new Map();
     this._ledgerLoads = new Map();
+    this._ledgerSaves = new Map();
+    this._ledgerDirty = new Set();
   }
   /**
    * The wallet's ledger of completed rows, loaded from the app's store the
@@ -821,10 +884,19 @@ export class WalletClient {
     const ledger = new Map();
     this._ledgers.set(walletId, ledger);
     this._ledgerLoads.set(walletId, Promise.resolve(ledger));
-    if (this._store)
-      try {
-        await this._store.save(walletId, []);
-      } catch {}
+    await this._saveLedger(walletId, []);
+  }
+  async _saveLedger(walletId, rows) {
+    if (!this._store) return;
+    const previous = this._ledgerSaves.get(walletId) ?? Promise.resolve();
+    const save = previous.catch(() => {}).then(() => this._store.save(walletId, rows));
+    this._ledgerSaves.set(walletId, save);
+    try {
+      await save;
+      if (this._ledgerSaves.get(walletId) === save) this._ledgerDirty.delete(walletId);
+    } catch {
+      this._ledgerDirty.add(walletId);
+    }
   }
   // Remember every completed row this snapshot shows. The store hears about
   // it only when something changed, and a store that fails never fails the
@@ -835,20 +907,26 @@ export class WalletClient {
     let changed = false;
     for (const row of rows) {
       if (row.status !== "completed") continue;
-      const { receiveStatusUnavailable, ...final } = row;
+      const { receiveStatusUnavailable, ...read } = row;
+      let final = keepPayAll(read, ledger.get(row.id));
+      // Replace a locally submitted row with its engine identity. Otherwise
+      // pruning that engine read would restore both copies of the payment.
+      for (const [id, saved] of ledger) {
+        if (id !== row.id && saved.reference === row.reference) {
+          final = keepPayAll(final, saved);
+          ledger.delete(id);
+          changed = true;
+        }
+      }
       const previous = ledger.get(row.id);
       if (previous && JSON.stringify(previous) === JSON.stringify(final))
         continue;
       ledger.set(row.id, clone(final));
       changed = true;
     }
-    if (changed && this._store)
-      try {
-        await this._store.save(
-          walletId,
-          [...ledger.values()].sort((a, b) => b.timestamp - a.timestamp),
-        );
-      } catch {}
+    if (changed || this._ledgerDirty.has(walletId))
+      await this._saveLedger(walletId, clone([...ledger.values()].sort((a, b) => b.timestamp - a.timestamp)));
+    else await this._ledgerSaves.get(walletId)?.catch(() => {});
   }
   selectWallet(id) {
     requires(
@@ -1498,6 +1576,10 @@ export class WalletClient {
       (a, b) => b.timestamp - a.timestamp,
     );
     await this._commitLedger(walletId, rows);
+    // Reads may overlap while receipt reconciliation or storage is pending.
+    // What this call returns must retain the exact facts learned meanwhile.
+    for (let index = 0; index < rows.length; index++)
+      rows[index] = keepPayAll(rows[index], ledger.get(rows[index].id));
     this._assertEpoch(epoch);
     return {
       wallet,
@@ -1578,7 +1660,14 @@ export class WalletClient {
       return null;
     }
   }
-  async prepareSend({ request, amountSats } = {}) {
+  async quoteMax({ request } = {}) {
+    const review = await this._prepareSend({ request, max: true }, false);
+    return { amountSats: review.amountSats, keptSats: review.keptSats, keptReason: review.keptReason };
+  }
+  async prepareSend(input = {}) {
+    return this._prepareSend(input, true);
+  }
+  async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
     const epoch = this._epoch;
     const rec = await this._record();
     const parsed = parsePayment(request, {
@@ -1599,6 +1688,10 @@ export class WalletClient {
     );
     const typed = amountOptional(amountSats);
     let amount = parsed.amountSats ?? target.amountSats ?? typed;
+    requires(!max || (parsed.amountSats == null && target.amountSats == null),
+      "This payment request fixes its amount. Send that amount instead.", "MAX_FIXED_AMOUNT");
+    requires(!max || typed == null,
+      "Choose either an amount or send max.", "AMOUNT_CONFLICT");
     // A request from another Beignet wallet may carry a direct-funding
     // envelope: one of this wallet's confirmed coins becomes the recipient's
     // channel funding directly, in one transaction. It takes a whole confirmed
@@ -1635,6 +1728,7 @@ export class WalletClient {
     let body;
     let route;
     let paymentHash;
+    let maxDetails;
     let expiresAt = this._now() + 60000;
     if (target.kind === "bolt11") {
       const decoded = await this._post(
@@ -1651,7 +1745,9 @@ export class WalletClient {
           "The invoice amount and request disagree.",
           "AMOUNT_CONFLICT",
         );
-      amount = positiveSats(decodedAmount ?? amount);
+      requires(!max || decodedAmount == null,
+        "This payment request fixes its amount. Send that amount instead.", "MAX_FIXED_AMOUNT");
+      if (!max) amount = positiveSats(decodedAmount ?? amount);
       const invoiceExpiry =
         (Number(decoded.timestamp) + Number(decoded.expiry ?? 3600)) * 1000;
       requires(
@@ -1680,7 +1776,7 @@ export class WalletClient {
         this._get("/liquidity"),
         this._get("/peers"),
       ]);
-      const sendable = integerField(liquidity.sendableSats, "available balance");
+      const sendable = integerField(liquidity.maxSendableSats ?? liquidity.sendableSats, "available balance");
       const refuseShortfall = async (needed) => {
         const primary = rec.lfbw?.primaryPubkey;
         requires(
@@ -1702,33 +1798,76 @@ export class WalletClient {
           "INSUFFICIENT_FUNDS",
         );
       };
-      if (amount > sendable) await refuseShortfall(amount);
-      const estimate = await this._post(
-        "/payment/estimate",
-        {
+      if (max) {
+        requirePrimary(rec, peers);
+        requires(sendable > 0, "There is no available balance to send.", "INSUFFICIENT_FUNDS");
+        const prior = await this._get(`/payment?paymentHash=${encodeURIComponent(paymentHash)}`)
+          .catch((error) => {
+            if (error?.code === "NOT_FOUND") return null;
+            throw error;
+          });
+        requires(!prior || activityStatus(prior.status) === "failed",
+          "This payment was already submitted. Check Activity before sending again.", "ALREADY_SUBMITTED");
+        const priorBudget = payAllRecord(prior?.payAll);
+        // Match the daemon's default cap: 1%, with a 50 sat floor. Leave at
+        // least one displayed sat for the recipient when the balance is small.
+        const proportional = (BigInt(sendable) + 99n) / 100n;
+        const defaultCap = proportional > 50n ? proportional : 50n;
+        const cap = priorBudget ? BigInt(priorBudget.maxFeeMsat)
+          : (defaultCap < BigInt(sendable) ? defaultCap : BigInt(sendable - 1)) * 1000n;
+        const [quote, channels] = await Promise.all([
+          this._post("/invoice/pay-all/quote", { bolt11: target.invoice, maxFeeMsat: cap.toString() }, true),
+          this._get("/channels"),
+        ]);
+        const debit = msatField(quote.debitMsat, "debit budget");
+        const minimum = msatField(quote.minRecipientMsat, "recipient minimum");
+        const maximumFee = msatField(quote.maxFeeMsat, "fee cap");
+        const remainder = msatField(quote.remainderMsat, "pay-all remainder");
+        requires(maximumFee === cap && debit > cap && minimum === debit - cap &&
+          (!priorBudget || debit.toString() === priorBudget.debitMsat),
+          "The wallet returned inconsistent pay-all bounds.", "INVALID_RESPONSE");
+        requires(quote.routeFound === true && remainder === 0n,
+          remainder ? `An exact send is unavailable. ${remainder} msat would remain.` : "No route can send this full budget. Try a smaller payment.",
+          remainder ? "PAY_ALL_REMAINDER" : "NO_ROUTE");
+        amount = msatFloor(minimum);
+        feeSats = msatCeil(cap);
+        maxDetails = {
+          max: true,
+          ...keptBalance(channels, msatFloor(debit)),
+          minRecipientSats: amount, maxFeeSats: feeSats,
+          debitSats: msatCeil(debit), debitMsat: debit.toString(), maxFeeMsat: cap.toString(),
+        };
+        path = "/invoice/pay-all";
+        body = { bolt11: target.invoice, debitMsat: debit.toString(), maxFeeMsat: cap.toString() };
+      } else {
+        if (amount > sendable) await refuseShortfall(amount);
+        const estimate = await this._post(
+          "/payment/estimate",
+          {
+            bolt11: target.invoice,
+            ...(decodedAmount == null ? { amountSats: amount } : {}),
+          },
+          true,
+        );
+        estimatedFeeSats = integerField(estimate.estimatedFeeSats, "payment fee");
+        // The review shows, and the payment is held to, a maximum: the
+        // estimate plus headroom for rounding and a retry.
+        feeSats = estimatedFeeSats + LIGHTNING_FEE_HEADROOM_SATS;
+        if (!(amount + feeSats <= sendable))
+          await refuseShortfall(amount + feeSats);
+        if (estimate.warning) warnings.push(estimate.warning);
+        path = "/invoice/pay-safe";
+        body = {
           bolt11: target.invoice,
           ...(decodedAmount == null ? { amountSats: amount } : {}),
-        },
-        true,
-      );
-      estimatedFeeSats = integerField(estimate.estimatedFeeSats, "payment fee");
-      if (!(amount + estimatedFeeSats <= sendable))
-        await refuseShortfall(amount + estimatedFeeSats);
-      // The review shows, and the payment is held to, a maximum: the
-      // estimate plus headroom for rounding and a retry.
-      feeSats = estimatedFeeSats + LIGHTNING_FEE_HEADROOM_SATS;
-      if (estimate.warning) warnings.push(estimate.warning);
+          maxFeeSats: feeSats,
+        };
+      }
       destination = target.invoice;
       description = text(decoded.description) || description;
       route = "lightning";
-      path = "/invoice/pay-safe";
-      body = {
-        bolt11: target.invoice,
-        ...(decodedAmount == null ? { amountSats: amount } : {}),
-        maxFeeSats: feeSats,
-      };
     } else {
-      amount = positiveSats(amount);
+      if (!max) amount = positiveSats(amount);
       destination = target.address;
       route = "bitcoin";
       const [channels, fees] = await Promise.all([
@@ -1762,7 +1901,7 @@ export class WalletClient {
           expiresAt,
           warnings,
         };
-        this._sendReviews.set(review.id, {
+        if (holdReview) this._sendReviews.set(review.id, {
           review: clone(review),
           walletId: this.connection.walletId,
           path,
@@ -1798,10 +1937,15 @@ export class WalletClient {
       const feeratePerkw = feeRate * 250;
       const quote = await this._post(
         "/channel/splice-quote",
-        { channelId: home.channelId, direction: "out", feeratePerkw },
+        { channelId: home.channelId, direction: "out", feeratePerkw, address: destination },
         true,
       );
       feeSats = integerField(quote.feeSats, "transaction fee");
+      if (max) {
+        requirePrimary(rec, await this._get("/peers"));
+        amount = positiveSats(quote.maxAmountSats);
+        maxDetails = { max: true, ...keptBalance([home], amount + feeSats) };
+      }
       if (!(amount <= integerField(quote.maxAmountSats, "send limit"))) {
         const arriving = await this._arrivingFunds(
           amount,
@@ -1834,12 +1978,13 @@ export class WalletClient {
       feeLabel:
         route === "lightning" ? "Maximum routing fee" : "Estimated network fee",
       ...(estimatedFeeSats != null ? { estimatedFeeSats } : {}),
-      totalSats: amount + feeSats,
+      totalSats: maxDetails?.debitSats ?? amount + feeSats,
+      ...maxDetails,
       route,
       expiresAt,
       warnings,
     };
-    this._sendReviews.set(review.id, {
+    if (holdReview) this._sendReviews.set(review.id, {
       review: clone(review),
       walletId: this.connection.walletId,
       path,
@@ -1849,6 +1994,7 @@ export class WalletClient {
     return review;
   }
   async send(review) {
+    const epoch = this._epoch;
     const held = this._sendReviews.get(review?.id);
     requires(
       held && held.walletId === this.connection.walletId,
@@ -1877,6 +2023,25 @@ export class WalletClient {
         "This payment was already submitted. Check Activity before sending again.",
         "ALREADY_SUBMITTED",
       );
+    if (held.review.max && held.path === "/channel/splice-out") {
+      const fees = await this._get("/fees/estimates");
+      const feeratePerkw = positiveSats(fees.normal) * 250;
+      const quote = await this._post("/channel/splice-quote", {
+        channelId: held.body.channelId, direction: "out", feeratePerkw,
+        address: held.body.address,
+      }, true);
+      this._assertEpoch(epoch);
+      requires(integerField(quote.maxAmountSats, "send limit") >= held.body.amountSats &&
+        integerField(quote.feeSats, "transaction fee") <= held.review.feeSats,
+        "The balance or fee changed. Review this max payment again.", "QUOTE_EXPIRED");
+      // A lower fee does not increase the reviewed recipient amount.
+      held.body = { ...held.body, feeratePerkw };
+    }
+    // A concurrent send may have consumed the review during the quote read.
+    requires(this._sendReviews.get(review.id) === held,
+      "Review this payment again before sending.", "INVALID_REVIEW");
+    requires(held.review.expiresAt > this._now(),
+      "This fee quote expired. Review the payment again.", "QUOTE_EXPIRED");
     this._sendReviews.delete(review.id);
     if (held.paymentHash)
       this._paymentLocks.add(`${held.walletId}:${held.paymentHash}`);
@@ -1884,7 +2049,7 @@ export class WalletClient {
       this._paymentLocks.add(`${held.walletId}:df:${held.envelope}`);
     if (held.path === "/direct-funding/send") {
       const result = await this._sendDirectFunding(review, held);
-      this._recordSubmission(review, held, result);
+      await this._recordSubmission(review, held, result);
       return result;
     }
     let result;
@@ -1913,17 +2078,23 @@ export class WalletClient {
           : response?.status
           ? activityStatus(response.status)
           : "uncertain";
+      const payAll = payAllRecord(response?.payAll);
+      if (held.path === "/invoice/pay-all")
+        requires(payAll && payAll.debitMsat === held.body.debitMsat &&
+          payAll.maxFeeMsat === held.body.maxFeeMsat,
+          "The wallet did not confirm the reviewed pay-all budget. Check Activity.", "INVALID_RESPONSE");
       result = {
         id: review.id,
         status,
-        amountSats: review.amountSats,
+        amountSats: payAll ? msatFloor(BigInt(payAll.deliveredMsat)) : review.amountSats,
         feeSats:
-          response?.feeSats == null
+          payAll ? msatCeil(BigInt(payAll.feeMsat)) : response?.feeSats == null
             ? review.feeSats
             : integerField(response.feeSats, "payment fee"),
         feeKnown: true,
         feeEstimated:
-          held.path === "/channel/splice-out" || response?.feeSats == null,
+          payAll ? status !== "completed" : held.path === "/channel/splice-out" || response?.feeSats == null,
+        ...(payAll ? { payAll } : {}),
         ...(response?.paymentHash || held.paymentHash
           ? { paymentHash: response?.paymentHash || held.paymentHash }
           : {}),
@@ -1941,6 +2112,10 @@ export class WalletClient {
             : "The payment result is unknown. Check Activity before sending again.",
       };
     } catch (error) {
+      if (held.review.max && error?.code === "PAY_ALL_REVIEW_EXPIRED") {
+        this._paymentLocks.delete(`${held.walletId}:${held.paymentHash}`);
+        throw new WalletError("The available balance changed. Review this max payment again.", "QUOTE_EXPIRED");
+      }
       result = {
         id: review.id,
         status: knownRefusal(error) ? "failed" : "uncertain",
@@ -1954,7 +2129,7 @@ export class WalletClient {
           : "The connection ended without a final result. The payment may still complete. Check Activity; do not send it again.",
       };
     }
-    this._recordSubmission(review, held, result);
+    await this._recordSubmission(review, held, result);
     return result;
   }
   /**
@@ -2025,11 +2200,11 @@ export class WalletClient {
       message: describeFunding(outcome),
     };
   }
-  _recordSubmission(review, held, result) {
+  async _recordSubmission(review, held, result) {
     if (result.status === "failed" && held.paymentHash)
       this._paymentLocks.delete(`${held.walletId}:${held.paymentHash}`);
     const reference = result.paymentHash || result.txid || review.id;
-    this._localActivity.unshift({
+    const row = {
       walletId: held.walletId,
       id: `submission:${review.id}`,
       kind: "sent",
@@ -2046,12 +2221,19 @@ export class WalletClient {
       feeSats: result.feeSats,
       feeKnown: result.feeKnown,
       feeEstimated: result.feeEstimated,
+      ...(result.payAll ? { payAll: result.payAll } : {}),
       status: result.status,
       timestamp: this._now(),
       reference,
       ...(result.paymentHash ? { paymentHash: result.paymentHash } : {}),
       ...(result.txid ? { txid: result.txid } : {}),
-    });
+    };
+    this._localActivity.unshift(row);
+    if (row.status === "completed") {
+      await this._ledgerFor(held.walletId);
+      const { walletId, ...saved } = row;
+      await this._commitLedger(held.walletId, [saved]);
+    }
   }
   async quoteReceive({ amountSats, description, mode, requestId } = {}) {
     validateReceiveMode(mode);
@@ -3059,7 +3241,14 @@ export class DemoWalletClient {
       demo: true,
     };
   }
-  async prepareSend({ request, amountSats } = {}) {
+  async quoteMax({ request } = {}) {
+    const review = await this._prepareSend({ request, max: true }, false);
+    return { amountSats: review.amountSats, keptSats: review.keptSats, keptReason: review.keptReason };
+  }
+  async prepareSend(input = {}) {
+    return this._prepareSend(input, true);
+  }
+  async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
     const parsed = parsePayment(request, { network: this.wallet.network });
     const preview = ["demo", "demo:coffee"].includes(
       text(request).trim().toLowerCase(),
@@ -3072,16 +3261,22 @@ export class DemoWalletClient {
     );
     const fixed = parsed.amountSats ?? parsed.lightning?.amountSats;
     const typed = amountOptional(amountSats);
+    requires(!max || fixed == null,
+      "This payment request fixes its amount. Send that amount instead.", "MAX_FIXED_AMOUNT");
+    requires(!max || typed == null,
+      "Choose either an amount or send max.", "AMOUNT_CONFLICT");
     requires(
       fixed == null || typed == null || fixed === typed,
       "The entered amount differs from the payment request.",
       "AMOUNT_CONFLICT",
     );
-    const amount = positiveSats(fixed ?? typed ?? (preview ? 4200 : null));
     const route =
       parsed.kind === "onchain" && !parsed.lightning ? "bitcoin" : "lightning";
-    const feeSats =
-      route === "bitcoin" ? 350 : Math.max(1, Math.ceil(amount * 0.0005));
+    let amount = max ? this._balance : positiveSats(fixed ?? typed ?? (preview ? 4200 : null));
+    const feeSats = route === "bitcoin" ? 350 : max
+      ? Math.min(Math.max(50, Math.ceil(amount / 100)), Math.max(0, amount - 1))
+      : Math.max(1, Math.ceil(amount * 0.0005));
+    if (max) amount = positiveSats(amount - feeSats);
     requires(
       amount + feeSats <= this._balance,
       "Your preview balance is too low.",
@@ -3098,11 +3293,15 @@ export class DemoWalletClient {
       feeLabel:
         route === "lightning" ? "Maximum routing fee" : "Estimated network fee",
       totalSats: amount + feeSats,
+      ...(max ? { max: true, keptSats: 0, keptReason: "none",
+        ...(route === "lightning" ? { minRecipientSats: amount, maxFeeSats: feeSats,
+          debitSats: this._balance, debitMsat: (BigInt(this._balance) * 1000n).toString(),
+          maxFeeMsat: (BigInt(feeSats) * 1000n).toString() } : {}) } : {}),
       route,
       expiresAt: Date.now() + 60000,
       warnings: ["Preview only. No real money will move."],
     };
-    this._sendReviews.set(review.id, clone(review));
+    if (holdReview) this._sendReviews.set(review.id, clone(review));
     return review;
   }
   async send(review) {
@@ -3117,16 +3316,28 @@ export class DemoWalletClient {
       "The quote expired. Review again.",
       "QUOTE_EXPIRED",
     );
+    requires(review.totalSats <= this._balance,
+      "The available balance changed. Review this payment again.", "QUOTE_EXPIRED");
     this._sendReviews.delete(review.id);
     this._balance -= review.totalSats;
     const status = review.route === "bitcoin" ? "pending" : "completed";
+    const feeSats = review.debitMsat
+      ? Math.min(review.feeSats, Math.max(1, Math.ceil(review.totalSats * 0.0005)))
+      : review.feeSats;
+    const amountSats = review.debitMsat ? review.totalSats - feeSats : review.amountSats;
+    const payAll = review.debitMsat ? {
+      debitMsat: review.debitMsat, maxFeeMsat: review.maxFeeMsat,
+      deliveredMsat: (BigInt(amountSats) * 1000n).toString(),
+      feeMsat: (BigInt(feeSats) * 1000n).toString(), remainderMsat: "0",
+    } : undefined;
     this._activity.unshift({
       id: review.id,
       kind: "sent",
       title: "Payment sent",
       description: review.description,
-      amountSats: review.amountSats,
-      feeSats: review.feeSats,
+      amountSats,
+      feeSats,
+      ...(payAll ? { payAll } : {}),
       status,
       timestamp: Date.now(),
       reference: `demo:${review.id}`,
@@ -3134,8 +3345,9 @@ export class DemoWalletClient {
     return {
       id: review.id,
       status,
-      amountSats: review.amountSats,
-      feeSats: review.feeSats,
+      amountSats,
+      feeSats,
+      ...(payAll ? { payAll } : {}),
       message:
         status === "completed"
           ? "Preview payment sent. No real money moved."

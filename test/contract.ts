@@ -43,6 +43,12 @@ async function verifyContract(
   void restored;
   void receiveStatus;
   const review = await client.prepareSend({ request: receive.uri });
+  const maximum = await client.quoteMax({ request: receive.uri });
+  const kept: number = maximum.keptSats;
+  const maxReview = await client.prepareSend({ request: receive.uri, max: true });
+  const exactBudget: string | undefined = maxReview.debitMsat;
+  void kept;
+  void exactBudget;
   return client.send(review);
 }
 const localClient: WalletClientInterface = new EmbeddedWalletClient({

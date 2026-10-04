@@ -187,7 +187,7 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 	const splicingSats = balance ? balance.splicingSats || 0 : (info && info.splicingBalanceSats) || 0;
 
 	const canSend = liquidity
-		? liquidity.sendableSats ?? liquidity.totalLocalBalanceSats ?? 0
+		? liquidity.maxSendableSats ?? liquidity.sendableSats ?? liquidity.totalLocalBalanceSats ?? 0
 		: home
 		? home.localBalanceSats || 0
 		: 0;

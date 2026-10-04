@@ -80,6 +80,7 @@ function fixture(overrides = {}, options = {}) {
     "/utxos": [{ height: 0, valueSats: 2000 }],
     "/peers": [{ pubkey: PK, state: "connected" }],
     "/payments": [],
+    "/payment": { response: result({ ok: false, error: { code: "NOT_FOUND", message: "Payment not found" } }, 404) },
     "/invoices": [],
     "/transactions": [],
     "GET /receive/requests": () => ({ requests: storedRequests }),
@@ -621,6 +622,7 @@ test("address payments quote and submit one splice-out; settlement remains pendi
     channelId: "channel-1",
     direction: "out",
     feeratePerkw: 500,
+    address: ADDRESS,
   });
   const sent = await client.send(review);
   assert.equal(sent.status, "pending");
@@ -4309,4 +4311,308 @@ test("primary update persists and clears same-key Iroh fallback before sending c
     { code: "INVALID_PRIMARY" }
   );
   assert.equal(calls.length, before);
+});
+
+const OPEN_INVOICE = bech32Encode("lnbc", new Array(111).fill(0));
+function maxFixture(overrides = {}, options = {}) {
+  let budget = "190000001";
+  const state = fixture({
+    "/liquidity": () => ({ sendableSats: 195000, maxSendableSats: Number(BigInt(budget) / 1000n) }),
+    "/channels": () => [{ ...channel, localBalanceSats: Number(BigInt(budget) / 1000n), localReserveWaived: true, isOpener: false }],
+    "/invoice/decode": { paymentHash: HASH, amountSats: null, timestamp: NOW / 1000 - 60, expiry: 3600 },
+    "/invoice/pay-all/quote": ({ maxFeeMsat }) => ({
+      debitMsat: budget, maxFeeMsat, minRecipientMsat: (BigInt(budget) - BigInt(maxFeeMsat)).toString(),
+      routeFound: true, remainderMsat: "0", searchExhausted: false,
+    }),
+    "/invoice/pay-all": ({ debitMsat, maxFeeMsat }) => ({
+      paymentHash: HASH, status: "COMPLETED", amountSats: Number(BigInt(debitMsat) / 1000n),
+      payAll: { debitMsat, maxFeeMsat, deliveredMsat: (BigInt(debitMsat) - 1701n).toString(), feeMsat: "1701", remainderMsat: "0" },
+    }),
+    ...overrides,
+  }, options);
+  return { ...state, setBudget(value) { budget = value; } };
+}
+
+test("send max quote holds no review; prepare freezes msat bounds and sends no later receipt", async () => {
+  const { client, calls, setBudget } = maxFixture();
+  const quote = await client.quoteMax({ request: OPEN_INVOICE });
+  assert.deepEqual(quote, { amountSats: 188100, keptSats: 0, keptReason: "none" });
+  assert.equal(client._sendReviews.size, 0);
+  const review = await client.prepareSend({ request: OPEN_INVOICE, max: true });
+  assert.equal(review.max, true);
+  assert.equal(review.debitMsat, "190000001");
+  assert.equal(review.maxFeeMsat, "1900000");
+  assert.equal(review.debitSats, 190001);
+  assert.equal(review.totalSats, 190001);
+  assert.equal(review.minRecipientSats, 188100);
+  assert.equal(review.maxFeeSats, 1900);
+  setBudget("210000999");
+  const sent = await client.send(review);
+  assert.equal(sent.status, "completed");
+  assert.equal(sent.amountSats, 189998);
+  assert.equal(sent.feeSats, 2);
+  assert.equal(sent.feeEstimated, false);
+  assert.deepEqual(sent.payAll, { debitMsat: "190000001", maxFeeMsat: "1900000", deliveredMsat: "189998300", feeMsat: "1701", remainderMsat: "0" });
+  assert.deepEqual(calls.find((call) => call.path === "/invoice/pay-all").body, {
+    bolt11: OPEN_INVOICE, debitMsat: "190000001", maxFeeMsat: "1900000",
+  });
+  assert.equal(calls.some((call) => call.path === "/payment/estimate" || call.path === "/invoice/pay-safe"), false);
+});
+
+test("send max exact figures survive a restart and an older payment read", async () => {
+  let saved = [];
+  const store = { load: () => saved, save: (_id, rows) => { saved = structuredClone(rows); } };
+  const first = maxFixture({}, { store });
+  first.setBudget("9007199254740993");
+  const review = await first.client.prepareSend({ request: OPEN_INVOICE, max: true });
+  const sent = await first.client.send(review);
+  assert.equal(sent.payAll.debitMsat, "9007199254740993");
+  assert.equal(sent.payAll.deliveredMsat, "9007199254739292");
+  assert.equal(saved.length, 1, "the result is durable before send returns");
+  assert.deepEqual(saved[0].payAll, sent.payAll);
+  const next = maxFixture({ "/payments": [{ paymentHash: HASH, direction: "OUTGOING", status: "COMPLETED", amountSats: 9007199254740, createdAt: NOW / 1000 }] }, { store });
+  const snapshot = await next.client.snapshot();
+  const rows = snapshot.activity.filter((row) => row.paymentHash === HASH);
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0].payAll, sent.payAll);
+  assert.equal(rows[0].amountSats, sent.amountSats);
+  assert.equal(rows[0].feeSats, sent.feeSats);
+  const reread = maxFixture({}, { store });
+  const pruned = (await reread.client.snapshot()).activity.filter((row) => row.paymentHash === HASH);
+  assert.equal(pruned.length, 1);
+  assert.deepEqual(pruned[0].payAll, sent.payAll);
+});
+
+test("send max rejects fixed requests and conflicting amount entry", async () => {
+  const { client } = maxFixture();
+  for (const request of [INVOICE, `bitcoin:${ADDRESS}?amount=0.0001`, `bitcoin:${ADDRESS}?lightning=${INVOICE}`]) {
+    await assert.rejects(client.prepareSend({ request, max: true }), { code: "MAX_FIXED_AMOUNT" });
+    await assert.rejects(client.quoteMax({ request }), { code: "MAX_FIXED_AMOUNT" });
+  }
+  await assert.rejects(client.prepareSend({ request: OPEN_INVOICE, max: true, amountSats: 50 }), { code: "AMOUNT_CONFLICT" });
+  const mismatched = maxFixture({ "/invoice/decode": { paymentHash: HASH, amountSats: 50 } });
+  await assert.rejects(mismatched.client.quoteMax({ request: OPEN_INVOICE }), { code: "MAX_FIXED_AMOUNT" });
+});
+
+test("send max refuses a named remainder and missing routes without holding reviews", async () => {
+  for (const remainder of ["1", "0"]) {
+    const { client, calls } = maxFixture({ "/invoice/pay-all/quote": ({ maxFeeMsat }) => ({
+      debitMsat: "190000001", maxFeeMsat, minRecipientMsat: (190000001n - BigInt(maxFeeMsat)).toString(),
+      remainderMsat: remainder, routeFound: false,
+    }) });
+    await assert.rejects(client.quoteMax({ request: OPEN_INVOICE }), { code: remainder === "1" ? "PAY_ALL_REMAINDER" : "NO_ROUTE" });
+    assert.equal(client._sendReviews.size, 0);
+    assert.equal(calls.some((call) => call.path === "/invoice/pay-all"), false);
+  }
+});
+
+test("send max rejects malformed exact amounts and changed quote caps", async () => {
+  for (const value of [190000001, "1e6", "-1", "190000001.0", "2100000000000000001"]) {
+    const { client } = maxFixture({ "/invoice/pay-all/quote": { debitMsat: value } });
+    await assert.rejects(client.quoteMax({ request: OPEN_INVOICE }), { code: "INVALID_RESPONSE" });
+  }
+  const { client } = maxFixture({ "/invoice/pay-all/quote": {
+    debitMsat: "190000001", maxFeeMsat: "1900001", minRecipientMsat: "188100000", remainderMsat: "0", routeFound: true,
+  } });
+  await assert.rejects(client.quoteMax({ request: OPEN_INVOICE }), { code: "INVALID_RESPONSE" });
+});
+
+test("send max maps a shrunken engine budget to an expired review and allows a fresh quote", async () => {
+  const { client, calls } = maxFixture({ "/invoice/pay-all": {
+    response: result({ ok: false, error: { code: "PAY_ALL_REVIEW_EXPIRED", message: "budget shrank" } }, 409),
+  } });
+  const review = await client.prepareSend({ request: OPEN_INVOICE, max: true });
+  await assert.rejects(client.send(review), { code: "QUOTE_EXPIRED" });
+  await assert.rejects(client.send(review), { code: "INVALID_REVIEW" });
+  await client.prepareSend({ request: OPEN_INVOICE, max: true });
+  assert.equal(calls.filter((call) => call.path === "/invoice/pay-all").length, 1);
+});
+
+test("send max uncertain responses keep the payment locked and never retry", async () => {
+  for (const answer of [new Error("timeout"), { status: "COMPLETED", paymentHash: HASH }]) {
+    const { client, calls } = maxFixture({ "/invoice/pay-all": answer });
+    const review = await client.prepareSend({ request: OPEN_INVOICE, max: true });
+    assert.equal((await client.send(review)).status, "uncertain");
+    await assert.rejects(client.prepareSend({ request: OPEN_INVOICE, max: true }), { code: "ALREADY_SUBMITTED" });
+    assert.equal(calls.filter((call) => call.path === "/invoice/pay-all").length, 1);
+  }
+});
+
+test("send max address quotes include each destination and retain the post-splice floor", async () => {
+  const taproot = bech32Encode("bc", [1, ...convertBits(new Array(32).fill(7), 8, 5, true)], "bech32m");
+  for (const address of [ADDRESS, taproot]) {
+    const { client, calls } = fixture();
+    const chip = await client.quoteMax({ request: address });
+    assert.deepEqual(chip, { amountSats: 180000, keptSats: 19775, keptReason: "reserve" });
+    assert.equal(client._sendReviews.size, 0);
+    const review = await client.prepareSend({ request: address, max: true });
+    assert.equal(review.amountSats, 180000);
+    const sent = await client.send(review);
+    assert.equal(sent.status, "pending");
+    assert.equal(calls.filter((call) => call.path === "/channel/splice-quote").every((call) => call.body.address === address), true);
+    assert.equal(calls.find((call) => call.path === "/channel/splice-out").body.amountSats, 180000);
+  }
+});
+
+test("send max address refuses a smaller balance or higher fee before dispatch", async () => {
+  for (const moved of [{ feeSats: 225, maxAmountSats: 179999 }, { feeSats: 226, maxAmountSats: 180000 }]) {
+    let changed = false;
+    const { client, calls } = fixture({ "/channel/splice-quote": () => changed ? moved : { feeSats: 225, maxAmountSats: 180000 } });
+    const review = await client.prepareSend({ request: ADDRESS, max: true });
+    changed = true;
+    await assert.rejects(client.send(review), { code: "QUOTE_EXPIRED" });
+    assert.equal(calls.some((call) => call.path === "/channel/splice-out"), false);
+  }
+});
+
+test("send max explains opener cost and legacy reserves, and requires a connected primary", async () => {
+  for (const [waived, reason] of [[true, "commitment-cost"], [false, "reserve"]]) {
+    const { client } = maxFixture({ "/channels": [{ ...channel, localBalanceSats: 191402, localReserveWaived: waived, isOpener: true }] });
+    const review = await client.prepareSend({ request: OPEN_INVOICE, max: true });
+    assert.equal(review.keptSats, 1402);
+    assert.equal(review.keptReason, reason);
+  }
+  const { client } = maxFixture({ "/peers": [] });
+  await assert.rejects(client.quoteMax({ request: OPEN_INVOICE }), { code: "PRIMARY_DOWN" });
+  await assert.rejects(client.quoteMax({ request: ADDRESS }), { code: "PRIMARY_DOWN" });
+});
+
+test("ordinary send includes fee headroom in its shortfall and uses the exact ceiling", async () => {
+  const { client, calls } = fixture({ "/liquidity": { sendableSats: 20000, maxSendableSats: 10016 } });
+  await assert.rejects(client.prepareSend({ request: INVOICE }), { code: "INSUFFICIENT_FUNDS" });
+  assert.equal(calls.some((call) => call.path === "/invoice/pay-safe"), false);
+  assert.equal(client._sendReviews.size, 0);
+});
+
+test("send max demo has review-free quotes, three bounds, exact results and no balance overrun", async () => {
+  const client = new DemoWalletClient();
+  const quote = await client.quoteMax({ request: "demo" });
+  assert.ok(quote.amountSats > 0);
+  assert.equal(client._sendReviews.size, 0);
+  const review = await client.prepareSend({ request: "demo", max: true });
+  const other = await client.prepareSend({ request: "demo", max: true });
+  assert.equal(review.minRecipientSats, quote.amountSats);
+  const sent = await client.send(review);
+  assert.equal(sent.status, "completed");
+  assert.ok(sent.amountSats >= review.minRecipientSats);
+  assert.equal(BigInt(sent.payAll.deliveredMsat) + BigInt(sent.payAll.feeMsat), BigInt(review.debitMsat));
+  await assert.rejects(client.send(other), { code: "QUOTE_EXPIRED" });
+});
+
+test("send max retries reuse the persisted debit and cap after a receipt and restart", async () => {
+  let prior = null;
+  const overrides = {
+    "/payment": () => prior ?? { response: result({ ok: false, error: { code: "NOT_FOUND" } }, 404) },
+    "/invoice/pay-all/quote": ({ maxFeeMsat }) => {
+      if (prior) assert.equal(maxFeeMsat, prior.payAll.maxFeeMsat);
+      const debitMsat = prior?.payAll.debitMsat ?? "190000001";
+      return { debitMsat, maxFeeMsat, minRecipientMsat: (BigInt(debitMsat) - BigInt(maxFeeMsat)).toString(), remainderMsat: "0", routeFound: true };
+    },
+    "/invoice/pay-all": ({ debitMsat, maxFeeMsat }) => {
+      prior = { status: "FAILED", paymentHash: HASH, payAll: {
+        debitMsat, maxFeeMsat, deliveredMsat: (BigInt(debitMsat) - 1701n).toString(), feeMsat: "1701", remainderMsat: "0",
+      } };
+      return prior;
+    },
+  };
+  const first = maxFixture(overrides);
+  const review = await first.client.prepareSend({ request: OPEN_INVOICE, max: true });
+  const failed = await first.client.send(review);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.feeEstimated, true);
+  first.setBudget("210000999");
+  const retry = await first.client.prepareSend({ request: OPEN_INVOICE, max: true });
+  assert.equal(retry.debitMsat, review.debitMsat);
+  assert.equal(retry.maxFeeMsat, review.maxFeeMsat);
+  const restarted = maxFixture(overrides);
+  restarted.setBudget("230000999");
+  const restored = await restarted.client.prepareSend({ request: OPEN_INVOICE, max: true });
+  assert.equal(restored.debitMsat, review.debitMsat);
+  assert.equal(restored.maxFeeMsat, review.maxFeeMsat);
+});
+
+test("send max pending attempts retain exact planned amounts without calling their fees measured", async () => {
+  const payAll = { debitMsat: "190000001", maxFeeMsat: "1900000", deliveredMsat: "189998300", feeMsat: "1701", remainderMsat: "0" };
+  for (const status of ["PENDING", "FAILED", "COMPLETED"]) {
+    const [row] = mergeActivity({ payments: [{ paymentHash: HASH, status, direction: "OUTGOING", payAll }] }, NOW);
+    assert.equal(row.feeEstimated, status !== "COMPLETED");
+    assert.deepEqual(row.payAll, payAll);
+  }
+  const { client } = maxFixture({ "/invoice/pay-all": { paymentHash: HASH, status: "PENDING", payAll } });
+  const sent = await client.send(await client.prepareSend({ request: OPEN_INVOICE, max: true }));
+  assert.equal(sent.status, "pending");
+  assert.equal(sent.feeEstimated, true);
+  await assert.rejects(client.quoteMax({ request: OPEN_INVOICE }), { code: "ALREADY_SUBMITTED" });
+});
+
+test("send max serializes durable saves so an older snapshot cannot erase its payment", async () => {
+  let release;
+  let started;
+  let writes = 0;
+  let saved = [];
+  const gate = new Promise((resolve) => { release = resolve; });
+  const began = new Promise((resolve) => { started = resolve; });
+  const store = {
+    load: () => [],
+    async save(_id, rows) {
+      writes++;
+      if (writes === 1) { started(); await gate; }
+      saved = structuredClone(rows);
+    },
+  };
+  const { client } = maxFixture({ "/payments": [{ paymentHash: "fe".repeat(32), direction: "INCOMING", status: "COMPLETED", amountSats: 500, createdAt: NOW / 1000 }] }, { store });
+  const oldSnapshot = client.snapshot();
+  await began;
+  const review = await client.prepareSend({ request: OPEN_INVOICE, max: true });
+  const send = client.send(review);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writes, 1, "the newer save waits for the older save");
+  release();
+  await oldSnapshot;
+  const sent = await send;
+  assert.equal(saved.length, 2);
+  assert.deepEqual(saved.find((row) => row.paymentHash === HASH).payAll, sent.payAll);
+  await client.snapshot();
+  assert.equal(saved.filter((row) => row.paymentHash === HASH).length, 1);
+});
+
+test("send max exact history survives an older overlapping completed snapshot", async () => {
+  const payAll = { debitMsat: "190000001", maxFeeMsat: "1900000", deliveredMsat: "189998300", feeMsat: "1701", remainderMsat: "0" };
+  let payment = { paymentHash: HASH, status: "COMPLETED", direction: "OUTGOING", amountSats: 190000, createdAt: NOW / 1000 };
+  let saved = [];
+  const store = { load: () => [], save: (_id, rows) => { saved = structuredClone(rows); } };
+  const { client } = maxFixture({ "/payments": () => [structuredClone(payment)] }, { store });
+  let release;
+  let paused;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const began = new Promise((resolve) => { paused = resolve; });
+  const reconcile = client._reconcileReceiveActivity.bind(client);
+  let first = true;
+  client._reconcileReceiveActivity = async (input) => {
+    if (first) { first = false; paused(); await gate; }
+    return reconcile(input);
+  };
+  const older = client.snapshot();
+  await began;
+  payment = { ...payment, payAll };
+  await client.snapshot();
+  release();
+  const returned = await older;
+  assert.deepEqual(returned.activity.find((row) => row.paymentHash === HASH).payAll, payAll);
+  assert.equal(saved.length, 1);
+  assert.deepEqual(saved[0].payAll, payAll);
+  assert.equal(saved[0].amountSats, 189998);
+});
+
+test("send max retained commitment cost stays in total and out of available balance", async () => {
+  const { client } = fixture({
+    "/balance": { lightning: 1402, onchain: 0, splicingSats: 0 },
+    "/liquidity": { maxSendableSats: 0, sendableSats: 1402 },
+    "/channels": [{ ...channel, localBalanceSats: 1402, isOpener: true, localReserveWaived: true }],
+    "/utxos": [],
+  });
+  const { balance } = await client.snapshot();
+  assert.equal(balance.totalSats, 1402);
+  assert.equal(balance.availableSats, 0);
+  assert.equal(balance.pendingSats, 0);
 });
