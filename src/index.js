@@ -498,10 +498,11 @@ export function mergeActivity(
   );
 }
 /**
- * The completed-activity ledger (wallet-core #19). A wallet must never show
+ * The durable activity ledger (wallet-core #19 and #30). A wallet must never show
  * less than it already knew: an engine that answers a read with fewer rows,
  * a lookup that fails, or a relaunch must not shorten the history or move a
- * completed row back to pending, expired or failed. The client keeps every
+ * completed row back to pending, expired or failed, except when the drain
+ * coordinator verifies a shallow reorg. The client keeps every
  * completed row it has shown, per wallet, and folds each read into it.
  */
 const ACTIVITY_KINDS = new Set(["sent", "received", "transfer"]);
@@ -511,6 +512,35 @@ const boundedId = (value) =>
   typeof value === "string" && value && value.length <= 128
     ? value
     : undefined;
+
+const DRAIN_PHASES = new Set(["review", "preparing", "closing", "sweeping", "pending", "cancelling", "cancelled", "completed"]);
+function drainRecord(value) {
+  requires(value && /^[a-zA-Z0-9_-]{8,128}$/.test(value.requestId) &&
+    DRAIN_PHASES.has(value.phase) && typeof value.address === "string" &&
+    value.address.length > 0 && value.address.length <= 128 &&
+    Array.isArray(value.txids) && value.txids.length <= 2 &&
+    value.txids.every((id) => typeof id === "string" && /^[a-f0-9]{64}$/.test(id)),
+    "The wallet returned incomplete drain tracking.", "INVALID_RESPONSE");
+  const row = { requestId: value.requestId, phase: value.phase, address: value.address,
+    txids: [...new Set(value.txids)], feeEstimated: value.feeEstimated === true };
+  for (const key of ["revision", "amountSats", "feeSats", "debitSats", "reviewedDebitSats", "closeAmountSats", "closeFeeSats", "sweepAmountSats", "sweepFeeSats", "createdAt", "expiresAt"])
+    row[key] = integerField(value[key], `drain ${key}`);
+  requires(row.amountSats + row.feeSats === row.debitSats &&
+    row.closeAmountSats + row.sweepAmountSats === row.amountSats &&
+    row.closeFeeSats + row.sweepFeeSats === row.feeSats,
+    "The wallet returned inconsistent drain amounts.", "INVALID_RESPONSE");
+  if (value.startedAt !== undefined) row.startedAt = integerField(value.startedAt, "drain start time");
+  if (value.residualSats !== undefined) row.residualSats = integerField(value.residualSats, "remaining balance");
+  return row;
+}
+const drainStatus = (phase) => phase === "completed" ? "completed" :
+  phase === "cancelled" ? "failed" : phase === "review" ? "uncertain" : "pending";
+
+function keepDrain(next, previous) {
+  if (!previous?.drain) return next;
+  if (!next.drain || previous.drain.revision > next.drain.revision) return clone(previous);
+  return next;
+}
 
 function activityStore(value) {
   if (value == null) return undefined;
@@ -581,12 +611,15 @@ function ledgerReceiveRequest(value, paymentHash) {
   }
 }
 
-// A row as an app's store hands it back. Only a completed sent, received or
-// transfer row qualifies; anything else, or anything malformed, is null.
+// A row as an app's store hands it back. Completed activity and validated
+// drain progress qualify; other pending activity remains engine-owned.
 function ledgerRow(raw) {
   try {
     if (!raw || typeof raw !== "object") return null;
-    if (raw.status !== "completed" || !ACTIVITY_KINDS.has(raw.kind)) return null;
+    let drain;
+    try { if (raw.drain) drain = drainRecord(raw.drain); }
+    catch { /* Invalid optional progress cannot remove completed history. */ }
+    if ((!drain && raw.status !== "completed") || !ACTIVITY_KINDS.has(raw.kind)) return null;
     const id = boundedText(raw.id, 256);
     const reference = boundedText(raw.reference, 256);
     if (!id || !reference) return null;
@@ -600,13 +633,14 @@ function ledgerRow(raw) {
       feeSats: integerField(raw.feeSats ?? 0, "activity fee"),
       feeKnown: raw.feeKnown === true,
       feeEstimated: raw.feeEstimated === true,
-      status: "completed",
+      status: drain ? (raw.status === "uncertain" ? "uncertain" : drainStatus(drain.phase)) : "completed",
       timestamp: raw.timestamp,
       reference,
     };
     if (boundedId(raw.txid)) row.txid = raw.txid;
     if (boundedId(raw.paymentHash)) row.paymentHash = raw.paymentHash.toLowerCase();
     if (boundedId(raw.address)) row.address = raw.address;
+    if (drain) row.drain = drain;
     try {
       const payAll = payAllRecord(raw.payAll);
       if (payAll) row.payAll = payAll;
@@ -638,8 +672,10 @@ function restoreActivity(known, read) {
   const byReference = new Map([...known.values()].map((row) => [row.reference, row]));
   const rows = read.map((row) => {
     const previous = known.get(row.id) ?? byReference.get(row.reference);
-    if (previous && row.status !== "completed") return { ...previous };
-    return keepPayAll(row, previous);
+    // Drain progress comes from the durable coordinator, including a shallow
+    // reorg or completed cancellation. Its current settlement state wins.
+    if (previous && row.status !== "completed" && !row.drain) return { ...previous };
+    return keepPayAll(keepDrain(row, previous), previous);
   });
   const kept = [...known.values()]
     .filter((row) => !ids.has(row.id) && !references.has(row.reference))
@@ -906,13 +942,14 @@ export class WalletClient {
     if (!ledger) return;
     let changed = false;
     for (const row of rows) {
-      if (row.status !== "completed") continue;
+      if (row.status !== "completed" && !row.drain) continue;
       const { receiveStatusUnavailable, ...read } = row;
-      let final = keepPayAll(read, ledger.get(row.id));
+      let final = keepPayAll(keepDrain(read, ledger.get(row.id)), ledger.get(row.id));
       // Replace a locally submitted row with its engine identity. Otherwise
       // pruning that engine read would restore both copies of the payment.
       for (const [id, saved] of ledger) {
-        if (id !== row.id && saved.reference === row.reference) {
+        if (id !== row.id && (saved.reference === row.reference ||
+          final.drain?.txids.includes(saved.txid))) {
           final = keepPayAll(final, saved);
           ledger.delete(id);
           changed = true;
@@ -1480,6 +1517,17 @@ export class WalletClient {
       );
     if (status.previousChannels.length > 0)
       notes.push("Funds with your previous primary remain in your total.");
+    for (const saved of [...ledger.values()].filter(row => row.drain && row.status === "uncertain")) {
+      try {
+        const progress = drainRecord(await this._request(`/wallets/${encodeURIComponent(walletId)}/api/drain?requestId=${encodeURIComponent(saved.drain.requestId)}`));
+        this._assertEpoch(epoch);
+        requires(progress.requestId === saved.drain.requestId && progress.address === saved.drain.address &&
+          progress.reviewedDebitSats === saved.drain.reviewedDebitSats,
+          "The wallet returned another drain.", "INVALID_RESPONSE");
+        await this._rememberDrain(walletId, progress);
+      } catch { /* Retain the uncertain row until the host supplies its outcome. */ }
+    }
+    this._assertEpoch(epoch);
     const journal = submissions.map((row) => ({
       id: text(row.id),
       kind: "sent",
@@ -1494,6 +1542,7 @@ export class WalletClient {
       reference: text(row.reference),
       ...(row.txid ? { txid: text(row.txid) } : {}),
       ...(row.address ? { address: text(row.address) } : {}),
+      ...(row.drain ? { drain: drainRecord(row.drain) } : {}),
     }));
     requires(
       journal.every((row) => row.id && row.reference),
@@ -1501,7 +1550,8 @@ export class WalletClient {
       "INVALID_RESPONSE",
     );
     const journalTxids = new Set(
-      journal.map((row) => row.txid).filter(Boolean),
+      [...journal.flatMap((row) => [row.txid, ...(row.drain?.txids ?? [])]),
+        ...[...ledger.values()].flatMap((row) => row.drain?.txids ?? [])].filter(Boolean),
     );
     let activity = [
       ...mergeActivity(
@@ -1526,6 +1576,7 @@ export class WalletClient {
     // are reconciled, so a remembered receipt marks its request paid and a
     // remembered coin is folded into its request like a freshly read one.
     const restored = restoreActivity(ledger, activity);
+    restored.rows = restored.rows.filter((row) => row.drain || !row.txid || !journalTxids.has(row.txid) || journal.some((entry) => entry.id === row.id));
     activity = await this._reconcileReceiveActivity({
       activity: restored.rows,
       savedRequests,
@@ -1572,14 +1623,20 @@ export class WalletClient {
       offlineReceiveAvailable: offline?.available !== undefined ? offline.available : wallet.lfbw?.offlineReceiveAvailable,
       offlineReceiveReason: offline?.reason !== undefined ? offline.reason : wallet.lfbw?.offlineReceiveReason,
     });
-    const rows = [...activity, ...local].sort(
+    let rows = [...activity, ...local].sort(
       (a, b) => b.timestamp - a.timestamp,
     );
     await this._commitLedger(walletId, rows);
     // Reads may overlap while receipt reconciliation or storage is pending.
     // What this call returns must retain the exact facts learned meanwhile.
     for (let index = 0; index < rows.length; index++)
-      rows[index] = keepPayAll(rows[index], ledger.get(rows[index].id));
+      rows[index] = keepPayAll(keepDrain(rows[index], ledger.get(rows[index].id)), ledger.get(rows[index].id));
+    const idsAfterSave = new Set(rows.map(row => row.id));
+    for (const saved of ledger.values())
+      if (saved.drain && !idsAfterSave.has(saved.id)) rows.push(clone(saved));
+    const finalDrainTxids = new Set([...ledger.values()].flatMap(row => row.drain?.txids ?? []));
+    rows = rows.filter(row => row.drain || !row.txid || !finalDrainTxids.has(row.txid))
+      .sort((a, b) => b.timestamp - a.timestamp);
     this._assertEpoch(epoch);
     return {
       wallet,
@@ -1666,6 +1723,91 @@ export class WalletClient {
   }
   async prepareSend(input = {}) {
     return this._prepareSend(input, true);
+  }
+  async prepareDrain({ address } = {}) {
+    const epoch = this._epoch;
+    const [rec, config] = await Promise.all([this._record(), this.getConfig()]);
+    this._assertEpoch(epoch);
+    requires(config.drainAvailable === true, "This wallet version does not support emptying to an address.", "DRAIN_UNAVAILABLE");
+    const parsed = parsePayment(address, { network: rec.network, now: this._now() });
+    requires(parsed.kind === "onchain", parsed.message || "Enter a Bitcoin address.", parsed.code || "INVALID_REQUEST");
+    requires(parsed.amountSats == null, "Use an address without a requested amount to empty this wallet.", "FIXED_AMOUNT");
+    const requestId = uid();
+    const progress = drainRecord(await this._post("/drain/quote", { requestId, address: parsed.address }, true));
+    this._assertEpoch(epoch);
+    requires(progress.requestId === requestId && progress.phase === "review" && progress.address === parsed.address && progress.expiresAt > this._now(),
+      "Review the wallet drain again.", "QUOTE_EXPIRED");
+    const review = { id: progress.requestId, destination: progress.address,
+      description: "Empty wallet to an address", amountSats: progress.amountSats,
+      feeSats: progress.feeSats, feeLabel: "Estimated network fees", totalSats: progress.debitSats,
+      route: "bitcoin", method: "drain", drain: progress, expiresAt: progress.expiresAt,
+      warnings: ["Your home channel closes cooperatively. Your primary must stay connected.",
+        "The final closing fee may change. Coins received after this review stay in your wallet.",
+        "The next receive can open a new channel."] };
+    this._sendReviews.set(review.id, { review: clone(review), walletId: this.connection.walletId,
+      path: "/drain/send", body: { requestId: review.id } });
+    return review;
+  }
+  async getDrain(requestId) {
+    requires(typeof requestId === "string" && /^[a-zA-Z0-9_-]{8,128}$/.test(requestId), "Select a valid wallet drain.", "INVALID_PARAMS");
+    const epoch = this._epoch;
+    const progress = drainRecord(await this._get(`/drain?requestId=${encodeURIComponent(requestId)}`));
+    this._assertEpoch(epoch);
+    requires(progress.requestId === requestId, "The wallet returned another drain.", "INVALID_RESPONSE");
+    await this._rememberDrain(this.connection.walletId, progress);
+    this._assertEpoch(epoch);
+    return progress;
+  }
+  async cancelDrain(requestId) {
+    requires(typeof requestId === "string" && /^[a-zA-Z0-9_-]{8,128}$/.test(requestId), "Select a valid wallet drain.", "INVALID_PARAMS");
+    const epoch = this._epoch;
+    const progress = drainRecord(await this._post("/drain/cancel", { requestId }));
+    this._assertEpoch(epoch);
+    requires(progress.requestId === requestId && progress.phase === "cancelled", "The wallet has not confirmed cancellation.", "RESULT_UNCERTAIN");
+    this._sendReviews.delete(requestId);
+    await this._rememberDrain(this.connection.walletId, progress);
+    this._assertEpoch(epoch);
+    return progress;
+  }
+  async _rememberDrain(walletId, progress) {
+    const ledger = await this._ledgerFor(walletId);
+    const id = `drain:${progress.requestId}`;
+    const previous = ledger.get(id);
+    if (previous?.drain) requires(progress.address === previous.drain.address &&
+      progress.reviewedDebitSats === previous.drain.reviewedDebitSats,
+      "The wallet returned different drain terms.", "INVALID_RESPONSE");
+    const update = (row) => ({ ...row, drain: progress, status: drainStatus(progress.phase),
+      amountSats: progress.amountSats, feeSats: progress.feeSats,
+      feeEstimated: progress.feeEstimated, txid: progress.txids[0],
+      title: progress.phase === "completed" ? "Wallet emptied" : progress.phase === "cancelled" ? "Wallet drain cancelled" : "Emptying wallet" });
+    this._localActivity = this._localActivity.map(row => row.walletId === walletId && row.id === id ? update(row) : row);
+    if (previous) await this._commitLedger(walletId, [update(previous)]);
+  }
+  async _sendDrain(review, held) {
+    let progress, problem;
+    const base = `/wallets/${encodeURIComponent(held.walletId)}/api`;
+    const validate = (value) => {
+      const next = drainRecord(value);
+      requires(next.requestId === review.id && next.address === review.destination &&
+        next.reviewedDebitSats === review.drain.reviewedDebitSats,
+        "The wallet did not confirm this drain. Check Activity.", "INVALID_RESPONSE");
+      return next;
+    };
+    try { progress = validate(await this._request(base + held.path, "POST", held.body)); }
+    catch (error) {
+      problem = error;
+      try { progress = validate(await this._request(`${base}/drain?requestId=${encodeURIComponent(review.id)}`)); }
+      catch { /* The saved identity is checked again after reconnect. */ }
+    }
+    const status = progress ? drainStatus(progress.phase) : "uncertain";
+    return { id: review.id, status, amountSats: progress?.amountSats ?? review.amountSats,
+      feeSats: progress?.feeSats ?? review.feeSats, feeKnown: true,
+      feeEstimated: progress?.feeEstimated ?? true,
+      drain: progress ?? clone(review.drain),
+      ...(progress?.txids[0] ? { txid: progress.txids[0] } : {}),
+      message: status === "completed" ? "Wallet emptied. Your next receive can open a new channel." :
+        status === "failed" ? problem?.message || "The wallet drain was cancelled." :
+        "The wallet drain is pending. Follow its progress in Activity before sending again." };
   }
   async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
     const epoch = this._epoch;
@@ -2043,6 +2185,12 @@ export class WalletClient {
     requires(held.review.expiresAt > this._now(),
       "This fee quote expired. Review the payment again.", "QUOTE_EXPIRED");
     this._sendReviews.delete(review.id);
+    if (held.path === "/drain/send") {
+      const result = await this._sendDrain(review, held);
+      await this._recordSubmission(review, held, result);
+      this._assertEpoch(epoch);
+      return result;
+    }
     if (held.paymentHash)
       this._paymentLocks.add(`${held.walletId}:${held.paymentHash}`);
     if (held.envelope)
@@ -2203,12 +2351,13 @@ export class WalletClient {
   async _recordSubmission(review, held, result) {
     if (result.status === "failed" && held.paymentHash)
       this._paymentLocks.delete(`${held.walletId}:${held.paymentHash}`);
-    const reference = result.paymentHash || result.txid || review.id;
+    const reference = review.method === "drain" ? review.id : result.paymentHash || result.txid || review.id;
     const row = {
       walletId: held.walletId,
-      id: `submission:${review.id}`,
+      id: review.method === "drain" ? `drain:${review.id}` : `submission:${review.id}`,
       kind: "sent",
       title:
+        review.method === "drain" ? (result.status === "completed" ? "Wallet emptied" : result.status === "failed" ? "Wallet drain cancelled" : "Emptying wallet") :
         result.status === "uncertain"
           ? "Payment result unknown"
           : result.status === "failed"
@@ -2222,6 +2371,7 @@ export class WalletClient {
       feeKnown: result.feeKnown,
       feeEstimated: result.feeEstimated,
       ...(result.payAll ? { payAll: result.payAll } : {}),
+      ...(result.drain ? { drain: result.drain } : {}),
       status: result.status,
       timestamp: this._now(),
       reference,
@@ -2229,7 +2379,7 @@ export class WalletClient {
       ...(result.txid ? { txid: result.txid } : {}),
     };
     this._localActivity.unshift(row);
-    if (row.status === "completed") {
+    if (row.status === "completed" || row.drain) {
       await this._ledgerFor(held.walletId);
       const { walletId, ...saved } = row;
       await this._commitLedger(held.walletId, [saved]);
@@ -3116,6 +3266,8 @@ export class DemoWalletClient {
       },
     };
     this._balance = 284650;
+    this._looseBalance = 50000;
+    this._drains = new Map();
     this._sendReviews = new Map();
     this._receiveQuotes = new Map();
     this._activity = [
@@ -3174,6 +3326,7 @@ export class DemoWalletClient {
       electrumPresets: [],
       torAvailable: true,
       lfbwAvailable: true,
+      drainAvailable: true,
       jitQuoteAvailable: true,
       recoveryAvailable: true,
     };
@@ -3215,12 +3368,12 @@ export class DemoWalletClient {
     return {
       wallet: clone(this.wallet),
       balance: {
-        totalSats: this._balance + 50000,
+        totalSats: this._balance + this._looseBalance,
         availableSats: this._balance,
-        pendingSats: 50000,
+        pendingSats: this._looseBalance,
         pending: {
           unconfirmedSats: 0,
-          confirmedSats: 50000,
+          confirmedSats: this._looseBalance,
           openingSats: 0,
           splicingSats: 0,
           closingSats: 0,
@@ -3234,9 +3387,9 @@ export class DemoWalletClient {
         connected: true,
         setup: "ready",
       },
-      notes: [
-        "50,000 sats are arriving. They will become available after confirmation.",
-      ],
+      notes: this._looseBalance ? [
+        `${formatSats(this._looseBalance)} sats are arriving. They will become available after confirmation.`,
+      ] : [],
       updatedAt: Date.now(),
       demo: true,
     };
@@ -3247,6 +3400,46 @@ export class DemoWalletClient {
   }
   async prepareSend(input = {}) {
     return this._prepareSend(input, true);
+  }
+  async prepareDrain({ address } = {}) {
+    const parsed = parsePayment(address, { network: this.wallet.network });
+    requires(parsed.kind === "onchain", parsed.message || "Enter a Bitcoin address.", parsed.code || "INVALID_REQUEST");
+    requires(parsed.amountSats == null, "Use an address without a requested amount to empty this wallet.", "FIXED_AMOUNT");
+    const closeFeeSats = this._balance ? 400 : 0;
+    const sweepFeeSats = this._looseBalance ? 200 : 0;
+    requires(this._balance + this._looseBalance > closeFeeSats + sweepFeeSats,
+      "There is nothing available to send.", "INSUFFICIENT_BALANCE");
+    const progress = { requestId: uid(), revision: 1, address: parsed.address, phase: "review",
+      closeAmountSats: this._balance - closeFeeSats, closeFeeSats,
+      sweepAmountSats: this._looseBalance - sweepFeeSats, sweepFeeSats,
+      amountSats: this._balance + this._looseBalance - closeFeeSats - sweepFeeSats,
+      feeSats: closeFeeSats + sweepFeeSats, debitSats: this._balance + this._looseBalance,
+      reviewedDebitSats: this._balance + this._looseBalance, feeEstimated: true,
+      txids: [], createdAt: Date.now(), expiresAt: Date.now() + 120000 };
+    const review = {id: progress.requestId, destination: progress.address,
+      description: "Empty wallet to an address", amountSats: progress.amountSats,
+      feeSats: progress.feeSats, totalSats: progress.debitSats,
+      feeLabel: "Estimated network fees", route: "bitcoin", method: "drain",
+      drain: progress, expiresAt: progress.expiresAt,
+      warnings: ["Your home channel closes cooperatively. The next receive can open a new channel.",
+        "Preview only. No real money moves."]};
+    this._drains.set(review.id, clone(progress));
+    this._sendReviews.set(review.id, clone(review));
+    return review;
+  }
+  async getDrain(requestId) {
+    const progress = this._drains.get(requestId);
+    requires(progress, "Wallet drain not found.", "NOT_FOUND");
+    return clone(progress);
+  }
+  async cancelDrain(requestId) {
+    const progress = await this.getDrain(requestId);
+    requires(["review", "cancelled"].includes(progress.phase), "The drain has already started.", "DRAIN_ALREADY_COMMITTED");
+    progress.phase = "cancelled";
+    progress.revision++;
+    this._drains.set(requestId, progress);
+    this._sendReviews.delete(requestId);
+    return clone(progress);
   }
   async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
     const parsed = parsePayment(request, { network: this.wallet.network });
@@ -3316,6 +3509,25 @@ export class DemoWalletClient {
       "The quote expired. Review again.",
       "QUOTE_EXPIRED",
     );
+    if (review.method === "drain") {
+      requires(review.totalSats <= this._balance + this._looseBalance,
+        "The available balance changed. Review again.", "QUOTE_EXPIRED");
+      this._sendReviews.delete(review.id);
+      this._balance -= review.drain.closeAmountSats + review.drain.closeFeeSats;
+      this._looseBalance -= review.drain.sweepAmountSats + review.drain.sweepFeeSats;
+      const txid = () => Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+      const progress = { ...clone(review.drain), revision: review.drain.revision + 1, phase: "pending", feeEstimated: false,
+        startedAt: Date.now(), txids: [review.drain.closeAmountSats ? txid() : null,
+          review.drain.sweepAmountSats ? txid() : null].filter(Boolean) };
+      this._drains.set(review.id, progress);
+      this._activity.unshift({ id: `drain:${review.id}`, kind: "sent", title: "Emptying wallet",
+        description: review.description, amountSats: progress.amountSats, feeSats: progress.feeSats,
+        feeKnown: true, feeEstimated: false, status: "pending", timestamp: Date.now(),
+        reference: review.id, txid: progress.txids[0], drain: clone(progress) });
+      return {id: review.id, status: "pending", amountSats: progress.amountSats,
+        feeSats: progress.feeSats, feeKnown: true, feeEstimated: false, drain: clone(progress),
+        txid: progress.txids[0], message: "Preview wallet drain is confirming. No real money moved."};
+    }
     requires(review.totalSats <= this._balance,
       "The available balance changed. Review this payment again.", "QUOTE_EXPIRED");
     this._sendReviews.delete(review.id);

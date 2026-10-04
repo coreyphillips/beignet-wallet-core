@@ -67,6 +67,7 @@ export interface Activity {
   feeKnown?: boolean;
   feeEstimated?: boolean;
   payAll?: PayAllAmounts;
+  drain?: DrainProgress;
   status: PaymentStatus;
   timestamp: number;
   reference: string;
@@ -148,17 +149,39 @@ export interface PayAllAmounts {
   feeMsat: string;
   remainderMsat: string;
 }
+export interface DrainProgress {
+  /** Monotonic coordinator revision, including reorg updates. */
+  revision: number;
+  requestId: string;
+  phase: "review" | "preparing" | "closing" | "sweeping" | "pending" | "cancelling" | "cancelled" | "completed";
+  address: string;
+  amountSats: number;
+  feeSats: number;
+  debitSats: number;
+  reviewedDebitSats: number;
+  closeAmountSats: number;
+  closeFeeSats: number;
+  sweepAmountSats: number;
+  sweepFeeSats: number;
+  feeEstimated: boolean;
+  txids: string[];
+  createdAt: number;
+  expiresAt: number;
+  startedAt?: number;
+  residualSats?: number;
+}
+export interface DrainInput { address: string; }
 export interface SendReview {
   id: string;
   destination: string;
   description: string;
   amountSats: number;
-  /** The most this payment can cost in fees; for Lightning, the estimate plus headroom. */
+  /** The Lightning fee cap, or the estimated network fees for a drain. */
   feeSats: number;
   feeLabel: string;
   /** Lightning only: the fee of the route that was priced, usually what is paid. */
   estimatedFeeSats?: number;
-  /** The most this payment can cost. Pay-all uses the debit ceiling rounded up. */
+  /** The reviewed debit. Pay-all rounds its ceiling up; drain closing fees may change. */
   totalSats: number;
   max?: true;
   keptSats?: number;
@@ -171,7 +194,8 @@ export interface SendReview {
   maxFeeMsat?: string;
   route: "lightning" | "bitcoin";
   /** Present when a Bitcoin route pays a direct-funding request instead of the address. */
-  method?: "direct-funding";
+  method?: "direct-funding" | "drain";
+  drain?: DrainProgress;
   expiresAt: number;
   warnings: string[];
 }
@@ -183,6 +207,7 @@ export interface SendResult {
   feeKnown?: boolean;
   feeEstimated?: boolean;
   payAll?: PayAllAmounts;
+  drain?: DrainProgress;
   txid?: string;
   paymentHash?: string;
   message: string;
@@ -284,6 +309,7 @@ export interface HostConfig {
   offlineReceiveAvailable?: boolean;
   concurrentOfflineReceiveAvailable?: boolean;
   jitQuoteAvailable?: boolean;
+  drainAvailable?: boolean;
   recoveryAvailable?: boolean;
   recoveryAutoApplyAvailable?: boolean;
   engineVersion?: string;
@@ -377,6 +403,9 @@ export interface WalletClientInterface {
   snapshot(): Promise<WalletSnapshot>;
   quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
+  prepareDrain(input: DrainInput): Promise<SendReview>;
+  getDrain(requestId: string): Promise<DrainProgress>;
+  cancelDrain(requestId: string): Promise<DrainProgress>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
   receive(quote: ReceiveQuote): Promise<ReceiveRequest>;
@@ -428,6 +457,9 @@ export class WalletClient implements WalletClientInterface {
   snapshot(): Promise<WalletSnapshot>;
   quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
+  prepareDrain(input: DrainInput): Promise<SendReview>;
+  getDrain(requestId: string): Promise<DrainProgress>;
+  cancelDrain(requestId: string): Promise<DrainProgress>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
   receive(quote: ReceiveQuote): Promise<ReceiveRequest>;
@@ -455,6 +487,9 @@ export class DemoWalletClient implements WalletClientInterface {
   snapshot(): Promise<WalletSnapshot>;
   quoteMax(input: { request: string }): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
+  prepareDrain(input: DrainInput): Promise<SendReview>;
+  getDrain(requestId: string): Promise<DrainProgress>;
+  cancelDrain(requestId: string): Promise<DrainProgress>;
   send(review: SendReview): Promise<SendResult>;
   quoteReceive(input?: ReceiveInput): Promise<ReceiveQuote>;
   receive(quote: ReceiveQuote): Promise<ReceiveRequest>;
