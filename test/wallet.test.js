@@ -3072,8 +3072,8 @@ test("a channel whose funding has not confirmed is explained, not presented as s
   const note = snapshot.notes.find((n) => n.includes("has not confirmed yet"));
   assert.ok(note, "expected a note about the unconfirmed funding");
   assert.match(note, /200,000 sats are in a transfer/);
-  assert.match(note, /Lightning sends work now/);
-  assert.match(note, /Bitcoin address sends wait/);
+  assert.match(note, /You can send now/);
+  assert.match(note, /Bitcoin address payments complete after confirmation/);
   // The funds are genuinely spendable over Lightning, so the sendable figure is
   // deliberately unchanged. Understating it would block payments that work.
   assert.equal(snapshot.balance.availableSats, 190000);
@@ -3091,42 +3091,57 @@ test("a confirmed channel says nothing, and an unknown one does not guess", asyn
   }
 });
 
-test("a Bitcoin send is refused while the channel's own funding is unconfirmed", async () => {
-  // The splice spends the channel funding output. On a zero-conf channel the
-  // engine drops its durable rebroadcast obligation as soon as the peer says
-  // the splice is locked, which is before any chain evidence exists, so a
-  // broadcast the network refuses is neither retried nor recorded: the payment
-  // never arrives and never reports a failure. Refuse rather than start it.
-  const { client, calls } = embeddedFixture({
-    "/channels": [{ ...channel, fundingConfirmed: false }],
-  });
-  await assert.rejects(
-    client.prepareSend({ request: ADDRESS, amountSats: 2000 }),
-    (error) => {
-      assert.equal(error.code, "FUNDING_UNCONFIRMED");
-      assert.match(error.message, /waiting for its own funding transaction/);
-      assert.match(error.message, /still send over Lightning now/);
-      return true;
-    },
-  );
-  // Nothing was quoted or submitted, so there is no half-started payment.
-  assert.ok(!calls.some((c) => c.path === "/channel/splice-quote"));
+test("usable unconfirmed channel funding permits ordinary and max Bitcoin sends", async () => {
+  for (const fundingConfirmed of [false, true, undefined]) {
+    const { client, calls } = embeddedFixture({
+      "/api/config": { engineVersion: "0.27.0-portable" },
+      "/channels": [{ ...channel, fundingConfirmed }],
+    });
+    const maximum = await client.quoteMax({ request: ADDRESS });
+    assert.equal(maximum.amountSats, 180000);
+    assert.equal(client._sendReviews.size, 0);
+    for (const input of [{ amountSats: 2000 }, { max: true }]) {
+      const review = await client.prepareSend({ request: ADDRESS, ...input });
+      assert.equal(review.route, "bitcoin");
+      assert.equal(review.amountSats, input.max ? maximum.amountSats : 2000);
+      assert.equal(review.warnings.some(note => note.includes("funding is unconfirmed")), fundingConfirmed === false);
+      const sent = await client.send(review);
+      assert.equal(sent.status, "pending");
+    }
+    assert.equal(calls.filter(c => c.path === "/channel/splice-out").length, 2);
+    const lightning = await client.prepareSend({ request: INVOICE });
+    assert.equal(lightning.route, "lightning");
+  }
+});
 
-  // Lightning is unaffected: those funds really are spendable.
-  const lightning = await client.prepareSend({ request: INVOICE });
-  assert.equal(lightning.route, "lightning");
+test("only qualified engines send against explicitly unconfirmed channel funding", async () => {
+  for (const engineVersion of [undefined, "", "0.16.0", "0.26.0-portable", "0.27.0-rc.1", "invalid"]) {
+    const { client, calls } = fixture({
+      "/api/config": { engineVersion },
+      "/channels": [{ ...channel, fundingConfirmed: false }],
+    });
+    await assert.rejects(client.quoteMax({ request: ADDRESS }), { code: "FUNDING_UNCONFIRMED" });
+    await assert.rejects(client.prepareSend({ request: ADDRESS, amountSats: 2000 }), { code: "FUNDING_UNCONFIRMED" });
+    assert.ok(!calls.some(c => c.path === "/channel/splice-quote" || c.path === "/channel/splice-out"));
+  }
+  for (const engineVersion of ["0.27.0", "0.27.0-portable", "0.28.0", "1.0.0"]) {
+    const { client } = fixture({
+      "/api/config": { engineVersion },
+      "/channels": [{ ...channel, fundingConfirmed: false }],
+    });
+    assert.equal((await client.quoteMax({ request: ADDRESS })).amountSats, 180000);
+  }
+});
 
-  // A confirmed channel sends to an address as before.
-  const { client: settled } = embeddedFixture({
-    "/channels": [{ ...channel, fundingConfirmed: true }],
-  });
-  const ok = await settled.prepareSend({ request: ADDRESS, amountSats: 2000 });
-  assert.equal(ok.route, "bitcoin");
-
-  // An unknown funding state is not treated as unconfirmed.
-  const { client: unknown } = embeddedFixture({ "/channels": [channel] });
-  const still = await unknown.prepareSend({ request: ADDRESS, amountSats: 2000 });
-  assert.equal(still.route, "bitcoin");
+test("unconfirmed funding does not bypass home channel usability", async () => {
+  for (const state of ["AWAITING_FUNDING_CONFIRMED", "AWAITING_REESTABLISH", "NORMAL"]) {
+    const { client, calls } = embeddedFixture({
+      "/channels": [{ ...channel, state, htlcUsable: false, fundingConfirmed: false }],
+    });
+    await assert.rejects(client.quoteMax({ request: ADDRESS }), { code: "NO_CHANNEL" });
+    await assert.rejects(client.prepareSend({ request: ADDRESS, amountSats: 2000 }), { code: "NO_CHANNEL" });
+    assert.ok(!calls.some(c => c.path === "/channel/splice-quote" || c.path === "/channel/splice-out"));
+  }
 });
 
 test("a payment within the total but above what can be sent explains what is arriving", async () => {

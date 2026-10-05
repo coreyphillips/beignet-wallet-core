@@ -1509,7 +1509,7 @@ export class WalletClient {
       notes.push(
         `${formatSats(
           unconfirmedFunding,
-        )} sats are in a transfer that has not confirmed yet. Lightning sends work now. Bitcoin address sends wait for that confirmation.`,
+        )} sats are in a transfer that has not confirmed yet. You can send now. Bitcoin address payments complete after confirmation.`,
       );
     if (channels.some((c) => c.restoreRecencyUnproven || c.fundingUnaccounted))
       notes.push(
@@ -2062,19 +2062,21 @@ export class WalletClient {
         "Your wallet is still getting ready to send to a Bitcoin address. Wait for its funds to become available.",
         "NO_CHANNEL",
       );
-      // Sending to a Bitcoin address splices the channel, which spends the
-      // channel's funding output. While that output is unconfirmed the splice
-      // is a child of an unconfirmed parent: a refused broadcast is now retried
-      // by the engine (Beignet 0.17.0 keeps a zero-conf splice's transaction
-      // until the chain has it), but the payment still cannot settle before
-      // the funding does, and the engine reports no confirmation depth of its
-      // own for a zero-conf channel. Wait for the funding instead of starting
-      // a payment that can only sit behind its parent.
-      requires(
-        home.fundingConfirmed !== false,
-        "This wallet's channel is still waiting for its own funding transaction to confirm. Sending to a Bitcoin address becomes available once it does. You can still send over Lightning now.",
-        "FUNDING_UNCONFIRMED",
-      );
+      // A usable zero-conf home channel can splice its unconfirmed funding.
+      // The engine retains and retries the signed transaction across restart;
+      // Activity verifies its payout on chain before reporting completion.
+      if (home.fundingConfirmed === false) {
+        // Older managed engines discarded an adopted zero-conf splice before
+        // chain confirmation. Only unlock the live-qualified engine range.
+        const version = /^(\d+)\.(\d+)\.(\d+)(?:-portable)?$/.exec(
+          text((await this.getConfig()).engineVersion),
+        );
+        const parts = version?.slice(1).map(Number);
+        requires(parts?.every(Number.isSafeInteger) &&
+          (parts[0] > 0 || parts[1] >= 27),
+          "Update your wallet engine to send before channel funding confirms, or wait for its first confirmation. Lightning sends work now.",
+          "FUNDING_UNCONFIRMED");
+      }
       const feeRate = positiveSats(fees.normal);
       const feeratePerkw = feeRate * 250;
       const quote = await this._post(
@@ -2108,7 +2110,9 @@ export class WalletClient {
         feeratePerkw,
         address: destination,
       };
-      warnings.push("Completes after one confirmation.");
+      warnings.push(home.fundingConfirmed === false
+        ? "The channel funding is unconfirmed. Both it and this payment must confirm before the payment completes."
+        : "Completes after one confirmation.");
     }
     this._assertEpoch(epoch);
     const review = {
