@@ -721,7 +721,8 @@ function parseBip21(text, warnings, opts) {
 				nodeId: env.nodeId,
 				network: env.network,
 				expiresAt: env.expiresAt,
-				amountSats: env.amountSats
+				amountSats: env.amountSats,
+				receiptHash: env.receiptHash
 			};
 		}
 	}

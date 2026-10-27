@@ -22,6 +22,10 @@
  * refuses a foreign chain, so a request this decoder gets wrong is one the
  * daemon refuses rather than one that pays the wrong thing. That is also why
  * a reading failure is a null and never a throw.
+ *
+ * The receipt hash is read too, for the receiver's side: it is what the
+ * engine records a payment of this request under, so a request saved before
+ * the hash was kept can still be matched to its payment (wallet-core #38).
  */
 
 const VERSION = 3;
@@ -96,6 +100,7 @@ export function decodeFundingEnvelope(text) {
 		amountSats = Number(amount);
 	}
 	const chainHash = toHex(bytes.subarray(17, 49));
+	const receiptAt = HEADER_BYTES + (hasAmount ? AMOUNT_BYTES : 0);
 	return {
 		version: VERSION,
 		requestId: toHex(bytes.subarray(1, 17)),
@@ -103,7 +108,11 @@ export function decodeFundingEnvelope(text) {
 		network: CHAIN_HASHES[chainHash] || null,
 		nodeId: toHex(bytes.subarray(49, 82)),
 		expiresAt,
-		amountSats
+		amountSats,
+		receiptHash:
+			bytes.length >= receiptAt + 32
+				? toHex(bytes.subarray(receiptAt, receiptAt + 32))
+				: null
 	};
 }
 
@@ -124,6 +133,7 @@ export function encodeFundingEnvelope({
 	amountSats = null,
 	network = 'mainnet',
 	requestId,
+	receiptHash,
 	transports = []
 } = {}) {
 	const id = requestId ? fromHex(requestId) : new Uint8Array(16).map((_, i) => (i * 37 + 11) & 0xff);
@@ -161,7 +171,8 @@ export function encodeFundingEnvelope({
 		view.setBigUint64(at, BigInt(amountSats));
 		at += AMOUNT_BYTES;
 	}
-	for (let i = 0; i < 32; i++) bytes[at + i] = (i * 53 + 7) & 0xff; // receipt hash
+	if (receiptHash) bytes.set(fromHex(receiptHash), at);
+	else for (let i = 0; i < 32; i++) bytes[at + i] = (i * 53 + 7) & 0xff; // receipt hash
 	at += 32;
 	bytes[at] = 0x02;
 	for (let i = 1; i < 33; i++) bytes[at + i] = (i * 29 + 3) & 0xff; // encryption key

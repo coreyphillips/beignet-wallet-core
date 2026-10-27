@@ -359,6 +359,106 @@ function publicStoredRequests(value) {
   );
   return requests;
 }
+const HASH = /^[a-f0-9]{64}$/;
+/**
+ * The receipt hash a request's direct-funding offer is paid against, or null
+ * when it carries none (wallet-core #38). Read from the envelope in its URI
+ * rather than stored, so a request saved before this still has one, and read
+ * with no clock, because an expired envelope still names its hash.
+ */
+function fundingReceiptHash(request) {
+  if (request?.bitcoinTracking === "lightning-only") return null;
+  try {
+    const parsed = parsePayment(text(request?.uri), { now: 0 });
+    const hash =
+      parsed.kind === "onchain" ? text(parsed.funding?.receiptHash) : "";
+    return HASH.test(hash) ? hash : null;
+  } catch {
+    return null;
+  }
+}
+/**
+ * The engine's record of the direct-funding payments it received, by receipt
+ * hash. An engine or host without GET /direct-funding/received, or an answer
+ * that is not a list, means no payments rather than an error: a request it
+ * cannot speak for is still tracked by its invoice and its address.
+ */
+function directFundingReceipts(value) {
+  const receipts = new Map();
+  if (!Array.isArray(value)) return receipts;
+  for (const entry of value) {
+    const receiptHash = text(entry?.receiptHash).toLowerCase();
+    const fundingTxid = text(entry?.fundingTxid).toLowerCase();
+    if (!HASH.test(receiptHash) || !HASH.test(fundingTxid)) continue;
+    if (entry.status !== "PAID" && entry.status !== "REVERTED") continue;
+    const amount = /^[1-9][0-9]{0,15}$/.test(text(entry.amountSat))
+      ? Number(entry.amountSat)
+      : null;
+    receipts.set(receiptHash, {
+      fundingTxid,
+      status: entry.status,
+      amountSats: Number.isSafeInteger(amount) ? amount : null,
+      paidAt: Number.isSafeInteger(entry.paidAt) && entry.paidAt > 0 ? entry.paidAt : null,
+    });
+  }
+  return receipts;
+}
+/**
+ * Whether a channel has locked a funding transaction: one that is on it and
+ * past setup, or has spliced past it since. A channel still setting up on it,
+ * or holding it as the splice it is waiting on, has not. Neither has the
+ * transaction no channel names, which is not a payment to count yet.
+ */
+function fundingLocked(channels, txid) {
+  let locked = false;
+  for (const channel of Array.isArray(channels) ? channels : []) {
+    if (channel?.pendingSpliceTxid === txid) return false;
+    if (channel?.fundingTxid === txid) {
+      if (FUNDING_SETUP_STATES.has(channel.state)) return false;
+      locked = true;
+    } else if (
+      Array.isArray(channel?.previousFundingTxids) &&
+      channel.previousFundingTxids.includes(txid)
+    )
+      locked = true;
+  }
+  return locked;
+}
+/**
+ * A request's status from the direct-funding payment that paid it, or null
+ * when none did or its splice was reverted (wallet-core #38). The payer funded
+ * this wallet's channel, which settles no invoice and pays no address. It is
+ * pending while that splice or open locks, and completed once it has.
+ *
+ * Null too when the amount is not known: an open-amount request the engine
+ * recorded no amount for (one paid before it kept them) is not shown, and so
+ * never saved, as a payment of 0.
+ */
+function directFundingStatus(request, receipts, channels) {
+  const receiptHash = fundingReceiptHash(request);
+  const receipt = receiptHash ? receipts?.get(receiptHash) : undefined;
+  if (receipt?.status !== "PAID") return null;
+  let amount = receipt.amountSats;
+  if (amount == null) {
+    try {
+      amount = amountOptional(request.amountSats);
+    } catch {
+      amount = null;
+    }
+  }
+  if (!Number.isSafeInteger(amount) || amount <= 0) return null;
+  const locked = fundingLocked(channels, receipt.fundingTxid);
+  return {
+    phase: locked ? "completed" : "pending",
+    receivedSats: amount,
+    confirmedSats: locked ? amount : 0,
+    pendingSats: locked ? 0 : amount,
+    method: "direct-funding",
+    paymentHash: text(request.paymentHash).toLowerCase(),
+    fundingTxid: receipt.fundingTxid,
+    txids: [],
+  };
+}
 export function mergeActivity(
   {
     payments = [],
@@ -572,8 +672,13 @@ function ledgerReceiveStatus(value) {
       receivedSats: integerField(value.receivedSats, "received amount"),
       confirmedSats: integerField(value.confirmedSats, "confirmed amount"),
       pendingSats: integerField(value.pendingSats ?? 0, "pending amount"),
-      ...(value.method === "lightning" || value.method === "bitcoin"
+      ...(value.method === "lightning" ||
+      value.method === "bitcoin" ||
+      value.method === "direct-funding"
         ? { method: value.method }
+        : {}),
+      ...(HASH.test(text(value.fundingTxid))
+        ? { fundingTxid: value.fundingTxid }
         : {}),
       ...(boundedId(value.activityId) ? { activityId: value.activityId } : {}),
       ...(boundedId(value.paymentHash)
@@ -876,6 +981,11 @@ export class WalletClient {
     this._localActivity = [];
     this._receiveStatusCache = new Map();
     this._savedReceiveRequests = [];
+    // When, and for which wallet epoch, an engine answered NOT_FOUND for
+    // GET /direct-funding/received.
+    this._fundingRouteMissing = null;
+    // Whether this wallet's saved requests have been read since it was opened.
+    this._receiveRegistryRead = false;
     this._epoch = 0;
     // Completed activity per wallet, what the wallet has shown and must never
     // show less than (wallet-core #19). Keyed by wallet id, so selectWallet
@@ -977,6 +1087,7 @@ export class WalletClient {
     this._receiveQuotes.clear();
     this._receiveStatusCache.clear();
     this._savedReceiveRequests = [];
+    this._receiveRegistryRead = false;
   }
   _assertEpoch(epoch) {
     requires(
@@ -1357,6 +1468,7 @@ export class WalletClient {
       submissions,
       savedRequests,
       offline,
+      fundingsReceived,
     ] = await Promise.all([
       this._ledgerFor(walletId),
       this._record(),
@@ -1374,8 +1486,29 @@ export class WalletClient {
       // The device engine says how much an offline receive can take; a
       // host's daemon has no such route, and there the figure stays unknown.
       this._get("/receive/offline").catch(() => null),
+      // What says a request was paid by direct funding (wallet-core #38), read
+      // only while a saved request carries a direct-funding offer, and on the
+      // first refresh, before the saved requests are known, rather than after
+      // them. One saved since the last refresh is read for below.
+      !this._receiveRegistryRead ||
+      this._savedReceiveRequests.some((request) => fundingReceiptHash(request))
+        ? this._directFundingReceived()
+        : undefined,
     ]);
     this._assertEpoch(epoch);
+    let fundingReceipts = fundingsReceived;
+    if (fundingReceipts === undefined) {
+      let saved = [];
+      try {
+        saved = publicStoredRequests(savedRequests);
+      } catch {
+        // The registry check below reports a malformed list.
+      }
+      fundingReceipts = saved.some((request) => fundingReceiptHash(request))
+        ? await this._directFundingReceived()
+        : new Map();
+      this._assertEpoch(epoch);
+    }
     for (const value of [
       channels,
       utxos,
@@ -1582,6 +1715,7 @@ export class WalletClient {
       savedRequests,
       payments,
       invoices,
+      fundings: { receipts: fundingReceipts, channels },
       notes,
     });
     this._assertEpoch(epoch);
@@ -2820,12 +2954,14 @@ export class WalletClient {
     savedRequests,
     payments,
     invoices,
+    fundings = { receipts: new Map(), channels: [] },
     notes,
   }) {
     const epoch = this._epoch;
     let registryUnavailable = false;
     try {
       this._savedReceiveRequests = publicStoredRequests(savedRequests);
+      this._receiveRegistryRead = true;
     } catch {
       registryUnavailable = true;
     }
@@ -2846,7 +2982,17 @@ export class WalletClient {
           row.status === "completed" &&
           !row.txid,
       );
-      if (paid)
+      // A remembered receipt keeps the way it was paid: one paid by direct
+      // funding went into the channel, not over Lightning.
+      if (
+        paid?.receiveStatus?.method === "direct-funding" &&
+        paid.receiveStatus.phase === "completed"
+      )
+        cache.set(request.paymentHash, {
+          checkedAt: now,
+          status: { ...paid.receiveStatus, paymentHash: request.paymentHash },
+        });
+      else if (paid)
         cache.set(request.paymentHash, {
           checkedAt: now,
           status: {
@@ -2860,6 +3006,31 @@ export class WalletClient {
             txids: [],
           },
         });
+    }
+    // A request paid by direct funding settles no invoice and pays no address,
+    // so its status comes from the engine's record of the payment and the
+    // channels, both read with this refresh (wallet-core #38). It needs no
+    // lookup of its own, and once completed it stays completed.
+    for (const request of requests) {
+      const previous = cache.get(request.paymentHash)?.status;
+      if (previous?.phase === "completed") continue;
+      const receiptHash = fundingReceiptHash(request);
+      // A splice the payer undid by spending its coin elsewhere: the request
+      // was not paid after all, and its address is watched again.
+      if (
+        previous?.method === "direct-funding" &&
+        receiptHash &&
+        fundings.receipts?.get(receiptHash)?.status === "REVERTED"
+      ) {
+        cache.delete(request.paymentHash);
+        continue;
+      }
+      const status = directFundingStatus(
+        request,
+        fundings.receipts,
+        fundings.channels,
+      );
+      if (status) cache.set(request.paymentHash, { checkedAt: now, status });
     }
     for (const request of requests) {
       if (
@@ -2897,6 +3068,20 @@ export class WalletClient {
           previous.status.phase === "completed"
         )
           return false;
+        // Paid by direct funding: the read above keeps it current, and its
+        // address was never what paid it. Unless the engine no longer lists
+        // the payment, when the address is watched again (see below).
+        const receiptHash = fundingReceiptHash(request);
+        if (
+          previous?.status?.method === "direct-funding" &&
+          !(
+            previous.status.phase !== "completed" &&
+            fundings.receipts &&
+            receiptHash &&
+            !fundings.receipts.has(receiptHash)
+          )
+        )
+          return false;
         const ttl = previous?.failed
           ? 60000
           : previous?.status?.phase === "completed"
@@ -2919,6 +3104,7 @@ export class WalletClient {
             payments,
             invoices,
             true,
+            fundings,
           );
           this._assertEpoch(epoch);
           cache.set(request.paymentHash, { status, checkedAt: now });
@@ -2948,8 +3134,11 @@ export class WalletClient {
         !observation ||
         observation.failed ||
         registryUnavailable ||
+        // A shared address cannot say which request a coin paid, but an invoice
+        // or a direct-funding receipt names its request.
         (request.bitcoinTracking === "ambiguous" &&
-          status?.method !== "lightning");
+          status?.method !== "lightning" &&
+          status?.method !== "direct-funding");
       // A receipt the wallet already showed as complete stays complete when
       // this read and its lookup show less: a lookup that failed or has not
       // run yet since a relaunch, or an engine that forgot the payment.
@@ -3007,6 +3196,45 @@ export class WalletClient {
         for (const tx of status.transactions ?? [])
           covered.set(tx.txid, (covered.get(tx.txid) || 0) + tx.amountSats);
     }
+    // A request paid twice, by direct funding and some other way (two payers
+    // on one QR): it shows one receipt, and the direct-funding payment keeps a
+    // row of its own, so the money it brought stays in history.
+    const ledger = this._ledgers.get(this.connection.walletId);
+    const extras = [];
+    for (const request of requests) {
+      const shown = replacements.get(request.paymentHash);
+      if (!shown || shown.receiveStatus?.method === "direct-funding") continue;
+      const remembered = ledger?.get(`payment:${request.paymentHash}`);
+      const funded =
+        remembered?.receiveStatus?.method === "direct-funding" &&
+        remembered.receiveStatus.phase === "completed"
+          ? remembered.receiveStatus
+          : directFundingStatus(request, fundings.receipts, fundings.channels);
+      if (funded?.phase !== "completed" || !funded.fundingTxid) continue;
+      const id = `funding:${funded.fundingTxid}`;
+      if (activity.some((row) => row.id === id)) continue;
+      const receipt = fundings.receipts?.get(fundingReceiptHash(request));
+      extras.push({
+        id,
+        kind: "received",
+        title: "Payment received",
+        description: request.description || "",
+        amountSats: funded.receivedSats,
+        feeSats: 0,
+        feeKnown: false,
+        feeEstimated: false,
+        status: "completed",
+        timestamp:
+          (remembered?.receiveStatus?.method === "direct-funding" &&
+            remembered.timestamp) ||
+          receipt?.paidAt ||
+          now,
+        // Not the bare txid an on-chain row carries, which would take this
+        // row's place when the ledger is restored.
+        reference: id,
+        receiveStatus: { ...funded, paymentHash: request.paymentHash },
+      });
+    }
     const result = activity
       .filter((row) => !replacements.has(row.paymentHash))
       .flatMap((row) => {
@@ -3021,7 +3249,28 @@ export class WalletClient {
       notes.push(
         "Some receive requests are still being checked. Their last known status is shown.",
       );
-    return [...result, ...replacements.values()];
+    return [...result, ...replacements.values(), ...extras];
+  }
+  /**
+   * The engine's direct-funding payments received, by receipt hash, or null
+   * when they could not be read (wallet-core #38). An engine older than the
+   * route answers NOT_FOUND, which is no payments, and is asked again only
+   * after ten minutes or once the wallet changes, so an engine upgraded
+   * under an open client is still picked up.
+   */
+  async _directFundingReceived() {
+    const epoch = this._epoch;
+    const missing = this._fundingRouteMissing;
+    if (missing?.epoch === epoch && this._now() - missing.at < 600000)
+      return new Map();
+    try {
+      return directFundingReceipts(await this._get("/direct-funding/received"));
+    } catch (error) {
+      if (error?.code !== "NOT_FOUND") return null;
+      if (epoch === this._epoch)
+        this._fundingRouteMissing = { epoch, at: this._now() };
+      return new Map();
+    }
   }
   async getReceiveStatus(request) {
     const epoch = this._epoch;
@@ -3039,7 +3288,13 @@ export class WalletClient {
     });
     return status;
   }
-  async _receiveStatusFor(request, payments, invoices, registered = false) {
+  async _receiveStatusFor(
+    request,
+    payments,
+    invoices,
+    registered = false,
+    fundings = null,
+  ) {
     const epoch = this._epoch;
     const lightningOnly = request?.bitcoinTracking === "lightning-only";
     const parsed = parsePayment(request?.address);
@@ -3069,6 +3324,15 @@ export class WalletClient {
     );
     const matchesHash = (entry) =>
       text(entry?.paymentHash).toLowerCase() === paymentHash;
+    const remembered = [
+      ...(this._ledgers.get(this.connection.walletId)?.values() ?? []),
+    ].filter(
+      (entry) =>
+        entry.kind === "received" &&
+        entry.status === "completed" &&
+        !entry.txid &&
+        text(entry.paymentHash).toLowerCase() === paymentHash,
+    );
     const lightning = mergeActivity(
       {
         payments: payments
@@ -3084,12 +3348,8 @@ export class WalletClient {
     ) ||
       // A receipt the wallet already showed as settled over Lightning stays
       // settled when the engine's lists no longer carry the payment.
-      [...(this._ledgers.get(this.connection.walletId)?.values() ?? [])].find(
-        (entry) =>
-          entry.kind === "received" &&
-          entry.status === "completed" &&
-          !entry.txid &&
-          text(entry.paymentHash).toLowerCase() === paymentHash,
+      remembered.find(
+        (entry) => entry.receiveStatus?.method !== "direct-funding",
       );
     // A settled invoice proves fulfillment even when JIT fees make its actual
     // receipt smaller than the requested face amount. Never infer this from a
@@ -3115,6 +3375,65 @@ export class WalletClient {
         paymentHash,
         txids: [],
       };
+    // A payer may fund this wallet's channel instead, which settles no invoice
+    // and pays no address (wallet-core #38). Asked before the address, which
+    // that payment never touched, and whatever the address is shared with.
+    const receiptHash = fundingReceiptHash(request);
+    if (receiptHash) {
+      const known = remembered.find(
+        (entry) =>
+          entry.receiveStatus?.method === "direct-funding" &&
+          entry.receiveStatus.phase === "completed",
+      );
+      if (known) return { ...known.receiveStatus, paymentHash };
+      // What this wallet last showed: a read that fails keeps it, and one
+      // completed is final, saved to the ledger or not yet.
+      const cached = this._receiveStatusCache.get(paymentHash)?.status;
+      const shown = cached?.method === "direct-funding" ? cached : null;
+      if (shown?.phase === "completed") return { ...shown, paymentHash };
+      let funded = null;
+      let receipts = fundings?.receipts;
+      if (fundings) {
+        funded = directFundingStatus(
+          request,
+          fundings.receipts,
+          fundings.channels,
+        );
+      } else if (cached?.phase !== "completed") {
+        // A request settled some other way needs no read here. Otherwise the
+        // channels are read only for a payment the engine has a record of.
+        const received = await this._directFundingReceived();
+        this._assertEpoch(epoch);
+        receipts = received;
+        if (!received && shown) return { ...shown, paymentHash };
+        if (received?.get(receiptHash)?.status === "PAID") {
+          const channels = await this._get("/channels").catch(() => null);
+          this._assertEpoch(epoch);
+          if (!channels && shown) return { ...shown, paymentHash };
+          funded = directFundingStatus(request, received, channels ?? []);
+        }
+      }
+      if (funded) return funded;
+      // A pending payment the engine no longer lists, read without error:
+      // what became of it is not known, so it stands, but the address is
+      // watched again and a payment to it takes its place. Read with no
+      // receipts, so this is not asked again. A shared address cannot say
+      // which request a coin paid, so there it simply stands.
+      if (shown && receipts && !receipts.has(receiptHash)) {
+        if (request.bitcoinTracking === "ambiguous")
+          return { ...shown, paymentHash };
+        const viaAddress = await this._receiveStatusFor(
+          request,
+          payments,
+          invoices,
+          registered,
+          { receipts: null, channels: [] },
+        );
+        return viaAddress.phase === "waiting"
+          ? { ...shown, paymentHash }
+          : viaAddress;
+      }
+    }
     if (!registered) {
       // Another client can register a second invoice using an old host's
       // reused address. Never rely on the QR's original uniqueness flag.
