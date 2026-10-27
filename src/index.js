@@ -487,14 +487,20 @@ export function mergeActivity(
   // loses the open once a deposit is spliced in, and does not name a splice
   // that is still locking. The engine reports those two where it can
   // (beignet-portable-engine #16). A transaction still locking into its
-  // channel stays pending even once it has a confirmation.
+  // channel stays pending even once it has a confirmation. So does one on a
+  // channel waiting to reestablish, which may be one still locking: a
+  // disconnect, or a restart, puts a channel there whatever state it was in
+  // (wallet-core #42). One the ledger holds as completed stays completed.
   const fundingTxids = new Set();
   const lockingTxids = new Set();
   for (const channel of channels) {
     const { fundingTxid, pendingSpliceTxid, previousFundingTxids } = channel;
     if (typeof fundingTxid === "string" && fundingTxid) {
       fundingTxids.add(fundingTxid);
-      if (FUNDING_SETUP_STATES.has(channel.state))
+      if (
+        FUNDING_SETUP_STATES.has(channel.state) ||
+        channel.state === "AWAITING_REESTABLISH"
+      )
         lockingTxids.add(fundingTxid);
     }
     if (typeof pendingSpliceTxid === "string" && pendingSpliceTxid) {

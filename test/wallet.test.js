@@ -3075,6 +3075,9 @@ test("funding transfer history follows channel readiness without regressing comp
   for (const [state, htlcUsable, expected] of [
     ["AWAITING_FUNDING_CONFIRMED", false, "pending"],
     ["AWAITING_CHANNEL_READY", false, "pending"],
+    // Whatever state the channel was in before a disconnect, or a restart:
+    // the ledger keeps one already shown as completed (wallet-core #42).
+    ["AWAITING_REESTABLISH", false, "pending"],
     ["NORMAL", true, "completed"],
     ["NORMAL", false, "completed"],
     ["CLOSED", false, "completed"],
@@ -3095,6 +3098,41 @@ test("funding transfer history follows channel readiness without regressing comp
     assert.equal(rows[0].kind, "transfer");
     assert.equal(rows[0].status, expected, state);
   }
+});
+
+test("a disconnect does not complete a funding transfer before its channel locks, and one completed stays so (wallet-core #42)", async () => {
+  const txid = "55".repeat(32);
+  const store = memoryStore();
+  let state = "AWAITING_CHANNEL_READY";
+  const routes = {
+    "/channels": () => [
+      { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: txid, state },
+    ],
+    "/transactions": [
+      { txid, type: "sent", valueSats: -10000, confirmed: true, timestamp: NOW },
+    ],
+  };
+  const statusOf = async (client) =>
+    (await client.snapshot()).activity.find(
+      (row) => row.id === `transaction:${txid}`,
+    ).status;
+  const first = fixture(routes, { store });
+  for (const next of [
+    "AWAITING_CHANNEL_READY",
+    "AWAITING_REESTABLISH",
+    "AWAITING_CHANNEL_READY",
+  ]) {
+    state = next;
+    assert.equal(await statusOf(first.client), "pending", state);
+  }
+  state = "AWAITING_REESTABLISH";
+  assert.equal(await statusOf(fixture(routes, { store }).client), "pending", "relaunched");
+
+  state = "NORMAL";
+  assert.equal(await statusOf(first.client), "completed");
+  state = "AWAITING_REESTABLISH";
+  assert.equal(await statusOf(first.client), "completed");
+  assert.equal(await statusOf(fixture(routes, { store }).client), "completed", "relaunched");
 });
 
 test("moving the wallet's own coins into its channel stays a transfer through a splice", () => {
