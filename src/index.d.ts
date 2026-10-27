@@ -272,7 +272,14 @@ export interface ReceiveStatus {
   /** Confirmed address-output total, or the settled Lightning receipt amount. */
   confirmedSats: number;
   pendingSats: number;
-  method?: "lightning" | "bitcoin";
+  /**
+   * "direct-funding" when the payer funded this wallet's channel instead of
+   * paying the invoice or the address: pending while the splice or open is
+   * locking, completed once the channel is on it.
+   */
+  method?: "lightning" | "bitcoin" | "direct-funding";
+  /** The splice or open transaction a direct-funding payment went into. */
+  fundingTxid?: string;
   activityId?: string;
   paymentHash?: string;
   /** All matching Bitcoin transaction IDs, deduplicated and sorted. */
@@ -555,6 +562,8 @@ export type ParsedPayment =
         envelope: string;
         expiresAt: number;
         amountSats: number | null;
+        /** What the receiver records a payment of this request under. */
+        receiptHash: string | null;
       } | null;
       warnings: PaymentWarning[];
     };
