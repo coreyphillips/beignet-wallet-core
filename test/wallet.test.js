@@ -2046,6 +2046,32 @@ test("a pending direct-funding payment the engine stops listing stands, and its 
   );
 });
 
+test("a pending direct-funding payment the engine stops listing stands on a shared address too", async () => {
+  let received = [dfPaid()];
+  const f = fixture({
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": () => received,
+    "/channels": [{ ...channel, fundingTxid: DF_OLD_FUNDING, pendingSpliceTxid: DF_SPLICE }],
+  });
+  const base = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const shared = { ...base, bitcoinTracking: "ambiguous", createdAt: NOW };
+  f.storedRequests.length = 0;
+  f.storedRequests.push(shared, {
+    ...base,
+    uri: base.uri.replace(/bgnq=[^&]+/, `bgnq=${dfOffer({ receiptHash: "99".repeat(32) }).request}`),
+    paymentHash: "b2".repeat(32),
+    bitcoinTracking: "ambiguous",
+    createdAt: NOW,
+  });
+  await f.client.snapshot();
+  assert.equal((await f.client.getReceiveStatus(shared)).phase, "pending");
+  received = [];
+  const status = await f.client.getReceiveStatus(shared);
+  assert.deepEqual([status.phase, status.method], ["pending", "direct-funding"]);
+});
+
 test("receive tracking requires exact paid Lightning proof and accepts its net amount after JIT fees", async () => {
   let payments = [
     {

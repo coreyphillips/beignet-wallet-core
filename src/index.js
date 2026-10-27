@@ -3417,8 +3417,11 @@ export class WalletClient {
       // A pending payment the engine no longer lists, read without error:
       // what became of it is not known, so it stands, but the address is
       // watched again and a payment to it takes its place. Read with no
-      // receipts, so this is not asked again.
+      // receipts, so this is not asked again. A shared address cannot say
+      // which request a coin paid, so there it simply stands.
       if (shown && receipts && !receipts.has(receiptHash)) {
+        if (request.bitcoinTracking === "ambiguous")
+          return { ...shown, paymentHash };
         const viaAddress = await this._receiveStatusFor(
           request,
           payments,
