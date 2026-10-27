@@ -45,6 +45,17 @@ const FUNDING_SETUP_STATES = new Set([
   "DUAL_FUNDING_V2",
   "AWAITING_TX_SIGNATURES",
 ]);
+// The states a channel reaches only once its funding has locked: a splice or
+// a close starts only from NORMAL. AWAITING_REESTABLISH is not one of them: a
+// disconnect, or a restart, puts a channel in it whatever state it was in, one
+// still waiting on its funding included, and the channel list does not say
+// which (wallet-core #40). A failed or closed channel may never have locked.
+const FUNDING_LOCKED_STATES = new Set([
+  "NORMAL",
+  "SPLICING",
+  "SHUTTING_DOWN",
+  "NEGOTIATING_CLOSING",
+]);
 let sequence = 0;
 const uid = () =>
   globalThis.crypto?.randomUUID?.() ??
@@ -404,17 +415,18 @@ function directFundingReceipts(value) {
   return receipts;
 }
 /**
- * Whether a channel has locked a funding transaction: one that is on it and
- * past setup, or has spliced past it since. A channel still setting up on it,
- * or holding it as the splice it is waiting on, has not. Neither has the
- * transaction no channel names, which is not a payment to count yet.
+ * Whether a channel has locked a funding transaction: one that is on it in a
+ * state only a locked channel reaches, or has spliced past it since. A channel
+ * on it in any other state, or holding it as the splice it is waiting on, has
+ * not been seen to. Neither has the transaction no channel names, which is not
+ * a payment to count yet.
  */
 function fundingLocked(channels, txid) {
   let locked = false;
   for (const channel of Array.isArray(channels) ? channels : []) {
     if (channel?.pendingSpliceTxid === txid) return false;
     if (channel?.fundingTxid === txid) {
-      if (FUNDING_SETUP_STATES.has(channel.state)) return false;
+      if (!FUNDING_LOCKED_STATES.has(channel.state)) return false;
       locked = true;
     } else if (
       Array.isArray(channel?.previousFundingTxids) &&
