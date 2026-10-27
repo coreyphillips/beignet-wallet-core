@@ -1724,6 +1724,256 @@ test("a reverted direct-funding payment, or one to some other request, does not 
   assert.equal((await client.getReceiveStatus(request)).phase, "completed");
 });
 
+// A request with a direct-funding offer, and the engine's record of a payment
+// against it (wallet-core #38).
+const DF_RECEIPT = "5e".repeat(32);
+const DF_OLD_FUNDING = "aa".repeat(32);
+const DF_SPLICE = "0d".repeat(32);
+const dfOffer = (extra = {}) => ({
+  request: encodeFundingEnvelope({
+    nodeId: PK,
+    expiresAt: NOW + 600000,
+    amountSats: 10000,
+    receiptHash: DF_RECEIPT,
+    ...extra,
+  }),
+  expiresAt: NOW + 600000,
+});
+const dfPaid = (extra = {}) => ({
+  receiptHash: DF_RECEIPT,
+  requestId: "11".repeat(16),
+  offerId: "22".repeat(16),
+  fundingTxid: DF_SPLICE,
+  channelId: "33".repeat(32),
+  splice: true,
+  amountSat: "10000",
+  status: "PAID",
+  paidAt: NOW,
+  updatedAt: NOW,
+  ...extra,
+});
+const dfLocked = [
+  { ...channel, fundingTxid: DF_SPLICE, previousFundingTxids: [DF_OLD_FUNDING] },
+];
+
+test("a direct-funding payment reverted while pending gives the request back, and its address is watched again", async () => {
+  let received = [];
+  let channels = [{ ...channel, fundingTxid: DF_OLD_FUNDING }];
+  let onchain = { address: ADDRESS, receivedSats: 0, confirmedSats: 0, transactions: [] };
+  const f = fixture({
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": () => received,
+    "/channels": () => channels,
+    "/receive/onchain": () => onchain,
+  });
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const rowOf = async () =>
+    (await f.client.snapshot()).activity.find(
+      (entry) => entry.paymentHash === request.paymentHash,
+    );
+  received = [dfPaid()];
+  channels = [{ ...channel, fundingTxid: DF_OLD_FUNDING, pendingSpliceTxid: DF_SPLICE }];
+  let row = await rowOf();
+  assert.deepEqual([row.kind, row.status, row.receiveStatus.method], ["received", "pending", "direct-funding"]);
+
+  received = [dfPaid({ status: "REVERTED" })];
+  channels = [{ ...channel, fundingTxid: DF_OLD_FUNDING }];
+  f.setNow(NOW + 60000);
+  row = await rowOf();
+  assert.deepEqual([row.kind, row.title], ["request", "Payment request"]);
+
+  // The payer pays the address instead.
+  onchain = {
+    address: ADDRESS,
+    receivedSats: 10000,
+    confirmedSats: 10000,
+    transactions: [{ txid: "ee".repeat(32), amountSats: 10000, confirmed: true }],
+  };
+  f.setNow(NOW + 120000);
+  row = await rowOf();
+  assert.deepEqual(
+    [row.kind, row.status, row.amountSats, row.receiveStatus.method],
+    ["received", "completed", 10000, "bitcoin"],
+  );
+});
+
+test("a direct-funding receipt survives a failed read, whichever route fails", async () => {
+  let received = () => [dfPaid()];
+  let channels = () => [{ ...channel, fundingTxid: DF_OLD_FUNDING, pendingSpliceTxid: DF_SPLICE }];
+  const f = fixture({
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": () => received(),
+    "/channels": () => channels(),
+  });
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "pending");
+  received = () => new Error("transient");
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "pending");
+  received = () => [dfPaid()];
+  channels = () => new Error("transient");
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "pending");
+
+  channels = () => dfLocked;
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "completed");
+  received = () => new Error("transient");
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "completed");
+  received = () => [dfPaid()];
+  channels = () => new Error("transient");
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "completed");
+
+  // The channel then moves on before any refresh saved the receipt.
+  channels = () => [{ ...channel, fundingTxid: "bb".repeat(32) }];
+  const row = (await f.client.snapshot()).activity.find(
+    (entry) => entry.paymentHash === request.paymentHash,
+  );
+  assert.deepEqual(
+    [row.kind, row.status, row.amountSats, row.receiveStatus.method],
+    ["received", "completed", 10000, "direct-funding"],
+  );
+});
+
+test("a request paid both by direct funding and over Lightning keeps both receipts", async () => {
+  const store = memoryStore();
+  let payments = [];
+  let invoices = [];
+  const routes = {
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": [dfPaid()],
+    "/channels": dfLocked,
+    "/payments": () => payments,
+    "/invoices": () => invoices,
+  };
+  const f = fixture(routes, { store });
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  await f.client.snapshot();
+  payments = [
+    {
+      paymentHash: request.paymentHash,
+      direction: "INCOMING",
+      amountSats: 9990,
+      status: "COMPLETED",
+      createdAt: NOW,
+      completedAt: NOW,
+    },
+  ];
+  invoices = [
+    {
+      paymentHash: request.paymentHash,
+      status: "PAID",
+      amountSats: 10000,
+      createdAt: NOW,
+      expiry: 600,
+      bolt11: request.bolt11,
+    },
+  ];
+  const receipts = (activity) =>
+    activity
+      .filter((row) => row.kind === "received")
+      .map((row) => [row.amountSats, row.status, row.receiveStatus?.method ?? null])
+      .sort((a, b) => a[0] - b[0]);
+  const both = [
+    [9990, "completed", "lightning"],
+    [10000, "completed", "direct-funding"],
+  ];
+  assert.deepEqual(receipts((await f.client.snapshot()).activity), both);
+  assert.deepEqual(receipts((await f.client.snapshot()).activity), both);
+
+  // And after a relaunch with an engine that forgot the direct funding.
+  const relaunch = fixture(
+    {
+      ...routes,
+      "GET /receive/requests": { requests: f.storedRequests },
+      "/direct-funding/received": [],
+      "/channels": [],
+    },
+    { store },
+  );
+  assert.deepEqual(receipts((await relaunch.client.snapshot()).activity), both);
+});
+
+test("a direct-funding payment of no known amount is never shown as 0", async () => {
+  const OPEN = bech32Encode("lnbc", new Array(111).fill(0));
+  const store = memoryStore();
+  const f = fixture(
+    {
+      "/direct-funding/request": dfOffer({ amountSats: null }),
+      "/direct-funding/received": [dfPaid({ amountSat: undefined })],
+      "/channels": dfLocked,
+      "/invoice/decode": () => ({
+        paymentHash: HASH,
+        amountSats: null,
+        description: "",
+        timestamp: NOW / 1000,
+        expiry: 600,
+      }),
+      "/invoice/create": { bolt11: OPEN, paymentHash: HASH, amountSats: null, createdAt: NOW, expiry: 600 },
+      "/jit/invoice": {
+        bolt11: OPEN,
+        paymentHash: HASH,
+        amountSats: null,
+        createdAt: NOW,
+        expiry: 600,
+        flatFeeSat: 0,
+        feePpm: 0,
+      },
+    },
+    { store },
+  );
+  const request = await f.client.receive(await f.client.quoteReceive({}));
+  const row = (await f.client.snapshot()).activity.find(
+    (entry) => entry.paymentHash === request.paymentHash,
+  );
+  assert.equal(row.kind, "request");
+  assert.ok(
+    !(store.saved["wallet-1"] ?? []).some((entry) => entry.paymentHash === request.paymentHash),
+  );
+});
+
+test("direct-funding receipts are read only where they can matter", async () => {
+  const missing = {
+    response: {
+      ok: false,
+      status: 404,
+      json: async () => ({ ok: false, error: { code: "NOT_FOUND", message: "Unknown route" } }),
+    },
+  };
+  const reads = (calls, from) =>
+    calls.slice(from).filter((c) => c.path === "/direct-funding/received").length;
+
+  // No saved request carries an offer: the route is never read.
+  const plain = fixture({ "/direct-funding/received": () => assert.fail("read") });
+  await plain.client.receive(await plain.client.quoteReceive({ amountSats: 10000 }));
+  await plain.client.snapshot();
+  await plain.client.snapshot();
+
+  // An engine without the route is asked once.
+  const old = fixture({ "/direct-funding/request": dfOffer(), "/direct-funding/received": missing });
+  const request = await old.client.receive(
+    await old.client.quoteReceive({ amountSats: 10000 }),
+  );
+  assert.equal((await old.client.getReceiveStatus(request)).phase, "waiting");
+  const from = old.calls.length;
+  await old.client.getReceiveStatus(request);
+  await old.client.snapshot();
+  assert.equal(reads(old.calls, from), 0);
+
+  // The channels are read for a request poll only when the engine has a
+  // payment for it.
+  const current = fixture({ "/direct-funding/request": dfOffer(), "/direct-funding/received": [] });
+  const waiting = await current.client.receive(
+    await current.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const before = current.calls.length;
+  await current.client.getReceiveStatus(waiting);
+  assert.ok(!current.calls.slice(before).some((c) => c.path === "/channels"));
+});
+
 test("receive tracking requires exact paid Lightning proof and accepts its net amount after JIT fees", async () => {
   let payments = [
     {
