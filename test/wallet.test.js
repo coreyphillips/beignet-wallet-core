@@ -1140,6 +1140,40 @@ test("canonical balances count disconnected, restore-held and parked-splice fund
   );
 });
 
+test("a disconnected opening stays in the balance where the channel list says it is one (wallet-core #42)", async () => {
+  // The engine's Lightning balance counts a disconnected channel by the state
+  // it was in before, so an opening is in it no more than when connected.
+  const away = (channelId, fundingTxid, preReestablishState) => ({
+    ...channel,
+    channelId,
+    state: "AWAITING_REESTABLISH",
+    htlcUsable: false,
+    localBalanceSats: 3000,
+    fundingTxid,
+    ...(preReestablishState ? { preReestablishState } : {}),
+  });
+  const sent = (txid) => ({
+    txid,
+    type: "sent",
+    valueSats: -3000,
+    feeSats: 1,
+    confirmed: false,
+    timestamp: NOW,
+  });
+  const { client } = fixture({
+    "/balance": { onchain: 2000, lightning: 3000, splicingSats: 0 },
+    "/channels": [
+      away("opening", "opening-funding", "AWAITING_FUNDING_CONFIRMED"),
+      away("open", "open-funding", "NORMAL"),
+      away("unknown", "unknown-funding"),
+    ],
+    "/transactions": [sent("opening-funding"), sent("open-funding"), sent("unknown-funding")],
+  });
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.pending.openingSats, 3000);
+  assert.equal(snapshot.balance.totalSats, 8000);
+});
+
 test("two prepared reviews cannot submit the same invoice twice", async () => {
   const { client, calls } = fixture();
   const first = await client.prepareSend({ request: INVOICE });
@@ -1800,33 +1834,41 @@ test("a direct-funding payment reverted while pending gives the request back, an
 });
 
 test("a direct-funding open is not completed by a disconnect, or a close, before it locks (wallet-core #40)", async () => {
-  const opened = (state) => [
+  const opened = (state, extra = {}) => [
     { ...channel, fundingTxid: DF_OLD_FUNDING },
-    { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: DF_SPLICE, state },
+    { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: DF_SPLICE, state, ...extra },
   ];
   let channels = opened("AWAITING_CHANNEL_READY");
-  const f = fixture({
+  const routes = {
     "/direct-funding/request": dfOffer(),
     "/direct-funding/received": [dfPaid({ splice: false })],
     "/channels": () => channels,
-  });
+  };
+  const f = fixture(routes);
   const request = await f.client.receive(
     await f.client.quoteReceive({ amountSats: 10000 }),
   );
-  const seen = async () => {
-    const row = (await f.client.snapshot()).activity.find(
+  const seenBy = async (client) => {
+    const row = (await client.snapshot()).activity.find(
       (entry) => entry.paymentHash === request.paymentHash,
     );
-    const status = await f.client.getReceiveStatus(request);
+    const status = await client.getReceiveStatus(request);
     return [row.status, status.phase, status.method];
   };
+  const seen = () => seenBy(f.client);
   assert.deepEqual(await seen(), ["pending", "pending", "direct-funding"]);
 
   // A disconnect, or a restart, puts the channel in AWAITING_REESTABLISH
-  // whatever state it was in, and the channel list does not say which. A
+  // whatever state it was in, which the engine may or may not report. A
   // channel can fail or close before its funding locks too.
-  for (const state of ["AWAITING_REESTABLISH", "ERRORED", "FORCE_CLOSED", "CLOSED"]) {
-    channels = opened(state);
+  for (const [state, extra] of [
+    ["AWAITING_REESTABLISH", { preReestablishState: "AWAITING_CHANNEL_READY" }],
+    ["AWAITING_REESTABLISH", {}],
+    ["ERRORED", {}],
+    ["FORCE_CLOSED", {}],
+    ["CLOSED", {}],
+  ]) {
+    channels = opened(state, extra);
     assert.deepEqual(await seen(), ["pending", "pending", "direct-funding"], state);
   }
 
@@ -1838,6 +1880,50 @@ test("a direct-funding open is not completed by a disconnect, or a close, before
   assert.deepEqual(await seen(), ["completed", "completed", "direct-funding"]);
   channels = opened("AWAITING_REESTABLISH");
   assert.deepEqual(await seen(), ["completed", "completed", "direct-funding"]);
+
+  // An app that keeps no ledger, as Chicory does, sees every channel
+  // disconnected after a restart. The state the engine reports from before
+  // says the open locked, and so does a channel that has spliced since.
+  const relaunch = (state) => {
+    channels = state;
+    return fixture({ ...routes, "GET /receive/requests": { requests: f.storedRequests } });
+  };
+  for (const restarted of [
+    opened("AWAITING_REESTABLISH", { preReestablishState: "NORMAL" }),
+    opened("AWAITING_REESTABLISH", { pendingSpliceTxid: "77".repeat(32) }),
+  ])
+    assert.deepEqual(
+      await seenBy(relaunch(restarted).client),
+      ["completed", "completed", "direct-funding"],
+      JSON.stringify(restarted[1]),
+    );
+  assert.deepEqual(
+    await seenBy(relaunch(opened("AWAITING_REESTABLISH")).client),
+    ["pending", "pending", "direct-funding"],
+    "an engine that does not say stays pending until the peer is back",
+  );
+});
+
+test("a direct-funding splice that locked stays completed across a restart with no ledger (wallet-core #42)", async () => {
+  let channels = dfLocked;
+  const routes = {
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": [dfPaid()],
+    "/channels": () => channels,
+  };
+  const f = fixture(routes);
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  assert.equal((await f.client.getReceiveStatus(request)).phase, "completed");
+  // The splice was adopted, so the channel names the funding it retired.
+  channels = [{ ...dfLocked[0], state: "AWAITING_REESTABLISH" }];
+  const relaunched = fixture({
+    ...routes,
+    "GET /receive/requests": { requests: f.storedRequests },
+  });
+  const status = await relaunched.client.getReceiveStatus(request);
+  assert.deepEqual([status.phase, status.method], ["completed", "direct-funding"]);
 });
 
 test("a direct-funding receipt survives a failed read, whichever route fails", async () => {
@@ -3072,16 +3158,32 @@ test("linked receipt activity preserves unlinked batch output value and never re
 
 test("funding transfer history follows channel readiness without regressing completed history when offline", () => {
   const txid = "55".repeat(32);
-  for (const [state, htlcUsable, expected] of [
-    ["AWAITING_FUNDING_CONFIRMED", false, "pending"],
-    ["AWAITING_CHANNEL_READY", false, "pending"],
-    ["NORMAL", true, "completed"],
-    ["NORMAL", false, "completed"],
-    ["CLOSED", false, "completed"],
-    ["SPLICING", false, "completed"],
+  const away = (preReestablishState) => ({
+    state: "AWAITING_REESTABLISH",
+    ...(preReestablishState ? { preReestablishState } : {}),
+  });
+  for (const [fields, htlcUsable, expected] of [
+    [{ state: "AWAITING_FUNDING_CONFIRMED" }, false, "pending"],
+    [{ state: "AWAITING_CHANNEL_READY" }, false, "pending"],
+    [{ state: "NORMAL" }, true, "completed"],
+    [{ state: "NORMAL" }, false, "completed"],
+    [{ state: "CLOSED" }, false, "completed"],
+    [{ state: "SPLICING" }, false, "completed"],
+    // A disconnect, or a restart, puts a channel in AWAITING_REESTABLISH
+    // whatever state it was in, which the engine may report (wallet-core #42).
+    [away("AWAITING_CHANNEL_READY"), false, "pending"],
+    [away("NORMAL"), false, "completed"],
+    // Where it does not, the open reads as before: an app keeping no ledger
+    // would otherwise show it pending again after every restart.
+    [away(), false, "completed"],
+    // A channel that has spliced locked its funding, even beside an earlier
+    // state this wallet does not know.
+    [{ ...away("A_LATER_STATE"), previousFundingTxids: ["aa".repeat(32)] }, false, "completed"],
+    [away("A_LATER_STATE"), false, "completed"],
   ]) {
+    const state = JSON.stringify(fields);
     const rows = mergeActivity({
-      channels: [{ fundingTxid: txid, state, htlcUsable }],
+      channels: [{ fundingTxid: txid, ...fields, htlcUsable }],
       transactions: [
         {
           txid,
@@ -3094,6 +3196,52 @@ test("funding transfer history follows channel readiness without regressing comp
     });
     assert.equal(rows[0].kind, "transfer");
     assert.equal(rows[0].status, expected, state);
+  }
+});
+
+test("a disconnect does not complete a funding transfer before its channel locks, and one completed stays so (wallet-core #42)", async () => {
+  const txid = "55".repeat(32);
+  const store = memoryStore();
+  let read = { state: "AWAITING_CHANNEL_READY" };
+  const away = (preReestablishState) => ({
+    state: "AWAITING_REESTABLISH",
+    ...(preReestablishState ? { preReestablishState } : {}),
+  });
+  const routes = {
+    "/channels": () => [
+      { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: txid, ...read },
+    ],
+    "/transactions": [
+      { txid, type: "sent", valueSats: -10000, confirmed: true, timestamp: NOW },
+    ],
+  };
+  const statusOf = async (client) =>
+    (await client.snapshot()).activity.find(
+      (row) => row.id === `transaction:${txid}`,
+    ).status;
+  const first = fixture(routes, { store });
+  for (const next of [
+    { state: "AWAITING_CHANNEL_READY" },
+    away("AWAITING_CHANNEL_READY"),
+    { state: "AWAITING_CHANNEL_READY" },
+  ]) {
+    read = next;
+    assert.equal(await statusOf(first.client), "pending", JSON.stringify(read));
+  }
+  read = away("AWAITING_CHANNEL_READY");
+  assert.equal(await statusOf(fixture(routes, { store }).client), "pending", "relaunched");
+
+  read = { state: "NORMAL" };
+  assert.equal(await statusOf(first.client), "completed");
+  read = away("NORMAL");
+  assert.equal(await statusOf(first.client), "completed");
+  assert.equal(await statusOf(fixture(routes, { store }).client), "completed", "relaunched");
+  // An app that keeps no ledger, as Chicory does, sees every channel
+  // disconnected after a restart: the open is still completed, with the
+  // earlier state reported or not.
+  for (const restarted of [away("NORMAL"), away()]) {
+    read = restarted;
+    assert.equal(await statusOf(fixture(routes).client), "completed", JSON.stringify(read));
   }
 });
 

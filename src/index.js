@@ -48,8 +48,9 @@ const FUNDING_SETUP_STATES = new Set([
 // The states a channel reaches only once its funding has locked: a splice or
 // a close starts only from NORMAL. AWAITING_REESTABLISH is not one of them: a
 // disconnect, or a restart, puts a channel in it whatever state it was in, one
-// still waiting on its funding included, and the channel list does not say
-// which (wallet-core #40). A failed or closed channel may never have locked.
+// still waiting on its funding included, and only an engine that reports the
+// state it was in before says which (wallet-core #40, beignet #1899). A failed
+// or closed channel may never have locked.
 const FUNDING_LOCKED_STATES = new Set([
   "NORMAL",
   "SPLICING",
@@ -415,9 +416,34 @@ function directFundingReceipts(value) {
   return receipts;
 }
 /**
- * Whether a channel has locked a funding transaction: one that is on it in a
- * state only a locked channel reaches, or has spliced past it since. A channel
- * on it in any other state, or holding it as the splice it is waiting on, has
+ * Whether a channel's current funding has locked: true, false while the
+ * channel is still setting up on it, or null when the channel list cannot say.
+ * A disconnect, or a restart, puts a channel in AWAITING_REESTABLISH whatever
+ * state it was in. The state it was in before, where the engine reports it
+ * (beignet #1899), says which; so does a splice, in flight or adopted, since
+ * one starts only from a locked channel and is adopted only once both sides
+ * have sent splice_locked. A failed or closed channel may never have locked.
+ */
+function currentFundingLocked(channel) {
+  let state = channel?.state;
+  if (state === "AWAITING_REESTABLISH") {
+    if (
+      channel.pendingSpliceTxid ||
+      (Array.isArray(channel.previousFundingTxids) &&
+        channel.previousFundingTxids.length > 0)
+    )
+      return true;
+    if (typeof channel.preReestablishState !== "string") return null;
+    state = channel.preReestablishState;
+  }
+  if (FUNDING_LOCKED_STATES.has(state)) return true;
+  if (FUNDING_SETUP_STATES.has(state)) return false;
+  return null;
+}
+/**
+ * Whether a channel has locked a funding transaction: one that is on it and
+ * known to have locked, or has spliced past it since. A channel on it that
+ * has not, or may not have, or holding it as the splice it is waiting on, has
  * not been seen to. Neither has the transaction no channel names, which is not
  * a payment to count yet.
  */
@@ -426,7 +452,7 @@ function fundingLocked(channels, txid) {
   for (const channel of Array.isArray(channels) ? channels : []) {
     if (channel?.pendingSpliceTxid === txid) return false;
     if (channel?.fundingTxid === txid) {
-      if (!FUNDING_LOCKED_STATES.has(channel.state)) return false;
+      if (currentFundingLocked(channel) !== true) return false;
       locked = true;
     } else if (
       Array.isArray(channel?.previousFundingTxids) &&
@@ -487,14 +513,17 @@ export function mergeActivity(
   // loses the open once a deposit is spliced in, and does not name a splice
   // that is still locking. The engine reports those two where it can
   // (beignet-portable-engine #16). A transaction still locking into its
-  // channel stays pending even once it has a confirmation.
+  // channel stays pending even once it has a confirmation, a disconnected one
+  // included where the channel list says so (wallet-core #42). One it cannot
+  // say about reads as before: an app keeping no ledger would otherwise show
+  // every open pending again after each restart.
   const fundingTxids = new Set();
   const lockingTxids = new Set();
   for (const channel of channels) {
     const { fundingTxid, pendingSpliceTxid, previousFundingTxids } = channel;
     if (typeof fundingTxid === "string" && fundingTxid) {
       fundingTxids.add(fundingTxid);
-      if (FUNDING_SETUP_STATES.has(channel.state))
+      if (currentFundingLocked(channel) === false)
         lockingTxids.add(fundingTxid);
     }
     if (typeof pendingSpliceTxid === "string" && pendingSpliceTxid) {
@@ -1548,10 +1577,12 @@ export class WalletClient {
     // Canonical Lightning already includes disconnected/restore-held NORMAL balances;
     // splicingSats is a separate daemon bucket. Only add genuinely funded openings.
     const observedTransactions = new Set(transactions.map((tx) => tx.txid));
+    // A disconnected opening is not in the Lightning balance either, so it
+    // counts here too where the channel list says it is one.
     const openingSats = channels
       .filter(
         (c) =>
-          FUNDING_SETUP_STATES.has(c.state) &&
+          currentFundingLocked(c) === false &&
           c.fundingTxid &&
           observedTransactions.has(c.fundingTxid),
       )
