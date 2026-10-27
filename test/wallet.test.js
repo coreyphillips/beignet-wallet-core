@@ -3176,6 +3176,10 @@ test("funding transfer history follows channel readiness without regressing comp
     // Where it does not, the open reads as before: an app keeping no ledger
     // would otherwise show it pending again after every restart.
     [away(), false, "completed"],
+    // A channel that has spliced locked its funding, even beside an earlier
+    // state this wallet does not know.
+    [{ ...away("A_LATER_STATE"), previousFundingTxids: ["aa".repeat(32)] }, false, "completed"],
+    [away("A_LATER_STATE"), false, "completed"],
   ]) {
     const state = JSON.stringify(fields);
     const rows = mergeActivity({
