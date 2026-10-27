@@ -1799,6 +1799,47 @@ test("a direct-funding payment reverted while pending gives the request back, an
   );
 });
 
+test("a direct-funding open is not completed by a disconnect, or a close, before it locks (wallet-core #40)", async () => {
+  const opened = (state) => [
+    { ...channel, fundingTxid: DF_OLD_FUNDING },
+    { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: DF_SPLICE, state },
+  ];
+  let channels = opened("AWAITING_CHANNEL_READY");
+  const f = fixture({
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": [dfPaid({ splice: false })],
+    "/channels": () => channels,
+  });
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const seen = async () => {
+    const row = (await f.client.snapshot()).activity.find(
+      (entry) => entry.paymentHash === request.paymentHash,
+    );
+    const status = await f.client.getReceiveStatus(request);
+    return [row.status, status.phase, status.method];
+  };
+  assert.deepEqual(await seen(), ["pending", "pending", "direct-funding"]);
+
+  // A disconnect, or a restart, puts the channel in AWAITING_REESTABLISH
+  // whatever state it was in, and the channel list does not say which. A
+  // channel can fail or close before its funding locks too.
+  for (const state of ["AWAITING_REESTABLISH", "ERRORED", "FORCE_CLOSED", "CLOSED"]) {
+    channels = opened(state);
+    assert.deepEqual(await seen(), ["pending", "pending", "direct-funding"], state);
+  }
+
+  // The peer comes back and the open goes on: nothing above was kept.
+  channels = opened("AWAITING_CHANNEL_READY");
+  assert.deepEqual(await seen(), ["pending", "pending", "direct-funding"]);
+
+  channels = opened("NORMAL");
+  assert.deepEqual(await seen(), ["completed", "completed", "direct-funding"]);
+  channels = opened("AWAITING_REESTABLISH");
+  assert.deepEqual(await seen(), ["completed", "completed", "direct-funding"]);
+});
+
 test("a direct-funding receipt survives a failed read, whichever route fails", async () => {
   let received = () => [dfPaid()];
   let channels = () => [{ ...channel, fundingTxid: DF_OLD_FUNDING, pendingSpliceTxid: DF_SPLICE }];
