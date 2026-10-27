@@ -1963,6 +1963,12 @@ test("direct-funding receipts are read only where they can matter", async () => 
   await old.client.snapshot();
   assert.equal(reads(old.calls, from), 0);
 
+  // An engine upgraded under an open client is asked again in time.
+  old.setNow(NOW + 600001);
+  const upgraded = old.calls.length;
+  await old.client.getReceiveStatus(request);
+  assert.equal(reads(old.calls, upgraded), 1);
+
   // The channels are read for a request poll only when the engine has a
   // payment for it.
   const current = fixture({ "/direct-funding/request": dfOffer(), "/direct-funding/received": [] });
@@ -1972,6 +1978,72 @@ test("direct-funding receipts are read only where they can matter", async () => 
   const before = current.calls.length;
   await current.client.getReceiveStatus(waiting);
   assert.ok(!current.calls.slice(before).some((c) => c.path === "/channels"));
+
+  // A relaunched client reads the route with the rest of its first refresh,
+  // not after the saved requests come back.
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let registryPending = false;
+  let readEarly = false;
+  const relaunch = fixture({
+    "GET /receive/requests": async () => {
+      registryPending = true;
+      await gate;
+      registryPending = false;
+      return { requests: current.storedRequests };
+    },
+    "/direct-funding/received": () => {
+      readEarly = registryPending;
+      release();
+      return [];
+    },
+  });
+  setTimeout(release, 50);
+  await relaunch.client.snapshot();
+  assert.ok(readEarly);
+});
+
+test("a pending direct-funding payment the engine stops listing stands, and its address is watched again", async () => {
+  let received = [dfPaid()];
+  let onchain = { address: ADDRESS, receivedSats: 0, confirmedSats: 0, transactions: [] };
+  const f = fixture({
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": () => received,
+    "/channels": [{ ...channel, fundingTxid: DF_OLD_FUNDING, pendingSpliceTxid: DF_SPLICE }],
+    "/receive/onchain": () => onchain,
+  });
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const rowOf = async () =>
+    (await f.client.snapshot()).activity.find(
+      (entry) => entry.paymentHash === request.paymentHash,
+    );
+  let row = await rowOf();
+  assert.deepEqual([row.status, row.receiveStatus.method], ["pending", "direct-funding"]);
+
+  received = [];
+  f.setNow(NOW + 60000);
+  const from = f.calls.length;
+  row = await rowOf();
+  assert.deepEqual([row.kind, row.status, row.receiveStatus.method], ["received", "pending", "direct-funding"]);
+  assert.equal((await f.client.getReceiveStatus(request)).method, "direct-funding");
+  assert.ok(f.calls.slice(from).some((c) => c.path === "/receive/onchain"));
+
+  onchain = {
+    address: ADDRESS,
+    receivedSats: 10000,
+    confirmedSats: 10000,
+    transactions: [{ txid: "ee".repeat(32), amountSats: 10000, confirmed: true }],
+  };
+  f.setNow(NOW + 120000);
+  row = await rowOf();
+  assert.deepEqual(
+    [row.kind, row.status, row.receiveStatus.method],
+    ["received", "completed", "bitcoin"],
+  );
 });
 
 test("receive tracking requires exact paid Lightning proof and accepts its net amount after JIT fees", async () => {

@@ -981,8 +981,11 @@ export class WalletClient {
     this._localActivity = [];
     this._receiveStatusCache = new Map();
     this._savedReceiveRequests = [];
-    // The epoch an engine answered NOT_FOUND for GET /direct-funding/received.
+    // When, and for which wallet epoch, an engine answered NOT_FOUND for
+    // GET /direct-funding/received.
     this._fundingRouteMissing = null;
+    // Whether this wallet's saved requests have been read since it was opened.
+    this._receiveRegistryRead = false;
     this._epoch = 0;
     // Completed activity per wallet, what the wallet has shown and must never
     // show less than (wallet-core #19). Keyed by wallet id, so selectWallet
@@ -1084,6 +1087,7 @@ export class WalletClient {
     this._receiveQuotes.clear();
     this._receiveStatusCache.clear();
     this._savedReceiveRequests = [];
+    this._receiveRegistryRead = false;
   }
   _assertEpoch(epoch) {
     requires(
@@ -1483,8 +1487,10 @@ export class WalletClient {
       // host's daemon has no such route, and there the figure stays unknown.
       this._get("/receive/offline").catch(() => null),
       // What says a request was paid by direct funding (wallet-core #38), read
-      // only while a saved request carries a direct-funding offer. One saved
-      // since the last refresh is read for below.
+      // only while a saved request carries a direct-funding offer, and on the
+      // first refresh, before the saved requests are known, rather than after
+      // them. One saved since the last refresh is read for below.
+      !this._receiveRegistryRead ||
       this._savedReceiveRequests.some((request) => fundingReceiptHash(request))
         ? this._directFundingReceived()
         : undefined,
@@ -2955,6 +2961,7 @@ export class WalletClient {
     let registryUnavailable = false;
     try {
       this._savedReceiveRequests = publicStoredRequests(savedRequests);
+      this._receiveRegistryRead = true;
     } catch {
       registryUnavailable = true;
     }
@@ -3062,8 +3069,19 @@ export class WalletClient {
         )
           return false;
         // Paid by direct funding: the read above keeps it current, and its
-        // address was never what paid it.
-        if (previous?.status?.method === "direct-funding") return false;
+        // address was never what paid it. Unless the engine no longer lists
+        // the payment, when the address is watched again (see below).
+        const receiptHash = fundingReceiptHash(request);
+        if (
+          previous?.status?.method === "direct-funding" &&
+          !(
+            previous.status.phase !== "completed" &&
+            fundings.receipts &&
+            receiptHash &&
+            !fundings.receipts.has(receiptHash)
+          )
+        )
+          return false;
         const ttl = previous?.failed
           ? 60000
           : previous?.status?.phase === "completed"
@@ -3236,17 +3254,21 @@ export class WalletClient {
   /**
    * The engine's direct-funding payments received, by receipt hash, or null
    * when they could not be read (wallet-core #38). An engine older than the
-   * route answers NOT_FOUND, which is no payments, and is not asked again
-   * until the wallet changes.
+   * route answers NOT_FOUND, which is no payments, and is asked again only
+   * after ten minutes or once the wallet changes, so an engine upgraded
+   * under an open client is still picked up.
    */
   async _directFundingReceived() {
     const epoch = this._epoch;
-    if (this._fundingRouteMissing === epoch) return new Map();
+    const missing = this._fundingRouteMissing;
+    if (missing?.epoch === epoch && this._now() - missing.at < 600000)
+      return new Map();
     try {
       return directFundingReceipts(await this._get("/direct-funding/received"));
     } catch (error) {
       if (error?.code !== "NOT_FOUND") return null;
-      if (epoch === this._epoch) this._fundingRouteMissing = epoch;
+      if (epoch === this._epoch)
+        this._fundingRouteMissing = { epoch, at: this._now() };
       return new Map();
     }
   }
@@ -3370,6 +3392,7 @@ export class WalletClient {
       const shown = cached?.method === "direct-funding" ? cached : null;
       if (shown?.phase === "completed") return { ...shown, paymentHash };
       let funded = null;
+      let receipts = fundings?.receipts;
       if (fundings) {
         funded = directFundingStatus(
           request,
@@ -3381,6 +3404,7 @@ export class WalletClient {
         // channels are read only for a payment the engine has a record of.
         const received = await this._directFundingReceived();
         this._assertEpoch(epoch);
+        receipts = received;
         if (!received && shown) return { ...shown, paymentHash };
         if (received?.get(receiptHash)?.status === "PAID") {
           const channels = await this._get("/channels").catch(() => null);
@@ -3390,6 +3414,22 @@ export class WalletClient {
         }
       }
       if (funded) return funded;
+      // A pending payment the engine no longer lists, read without error:
+      // what became of it is not known, so it stands, but the address is
+      // watched again and a payment to it takes its place. Read with no
+      // receipts, so this is not asked again.
+      if (shown && receipts && !receipts.has(receiptHash)) {
+        const viaAddress = await this._receiveStatusFor(
+          request,
+          payments,
+          invoices,
+          registered,
+          { receipts: null, channels: [] },
+        );
+        return viaAddress.phase === "waiting"
+          ? { ...shown, paymentHash }
+          : viaAddress;
+      }
     }
     if (!registered) {
       // Another client can register a second invoice using an old host's
