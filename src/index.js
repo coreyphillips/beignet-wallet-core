@@ -417,12 +417,6 @@ function directFundingReceipts(value) {
       status: entry.status,
       amountSats: Number.isSafeInteger(amount) ? amount : null,
       paidAt: Number.isSafeInteger(entry.paidAt) && entry.paidAt > 0 ? entry.paidAt : null,
-      // When the engine saw the funding lock (beignet #1899, 0.36.0). It
-      // outlives the channel, so it still answers once the channel is gone.
-      lockedAt:
-        Number.isSafeInteger(entry.lockedAt) && entry.lockedAt > 0
-          ? entry.lockedAt
-          : null,
     });
   }
   return receipts;
@@ -492,10 +486,15 @@ function fundingLocked(channels, txid) {
  * A request's status from the direct-funding payment that paid it, or null
  * when none did or its splice was reverted (wallet-core #38). The payer funded
  * this wallet's channel, which settles no invoice and pays no address. It is
- * pending while that splice or open locks, and completed once it has: once the
- * engine's record of the payment has a lockedAt (beignet #1899, 0.36.0), which
- * answers even after the channel has closed or left the list, or once the
- * channel list shows the funding locked.
+ * pending while that splice or open locks, and completed once the channel list
+ * shows the funding locked; the engine keeps a closed channel listed with the
+ * fundings it locked (lockedFundingTxids, beignet #1899, 0.36.0).
+ *
+ * The record's own lockedAt is not enough. A channel leaves the list only when
+ * the engine voids or abandons it, and a zero-conf open whose funding the payer
+ * double-spent locks first and is voided after: its record stays PAID with a
+ * lockedAt, for money that never arrived. A completed status is never asked
+ * again, so it must not rest on that.
  *
  * Null too when the amount is not known: an open-amount request the engine
  * recorded no amount for (one paid before it kept them) is not shown, and so
@@ -514,8 +513,7 @@ function directFundingStatus(request, receipts, channels) {
     }
   }
   if (!Number.isSafeInteger(amount) || amount <= 0) return null;
-  const locked =
-    receipt.lockedAt != null || fundingLocked(channels, receipt.fundingTxid);
+  const locked = fundingLocked(channels, receipt.fundingTxid);
   return {
     phase: locked ? "completed" : "pending",
     receivedSats: amount,

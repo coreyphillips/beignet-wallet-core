@@ -1904,9 +1904,9 @@ test("a direct-funding open is not completed by a disconnect, or a close, before
   );
 });
 
-test("an engine's record of the lock keeps a direct-funding payment completed through a disconnect, a close, or the channel leaving the list (beignet #1899)", async () => {
+test("an engine's record of the lock keeps a direct-funding payment completed through a disconnect or a close (beignet #1899)", async () => {
   // The engine (beignet 0.36.0+) records the fundings a channel locked, kept
-  // through close, and when a received payment's funding locked.
+  // through close.
   const opened = (state, extra = {}) => [
     { ...channel, fundingTxid: DF_OLD_FUNDING },
     { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: DF_SPLICE, state, ...extra },
@@ -1949,22 +1949,29 @@ test("an engine's record of the lock keeps a direct-funding payment completed th
     assert.deepEqual(await seenBy(relaunched.client), ["completed", "completed"], state);
   }
 
-  // The channel is gone from the list (a zero-conf open voided, or a row the
-  // engine deleted): the receipt's own lockedAt still answers.
+  // A funding the channel lists as locked counts even where the channel no
+  // longer runs on it and names it nowhere else.
+  channels = [
+    { ...channel, fundingTxid: DF_OLD_FUNDING },
+    { ...channel, channelId: "moved", fundingTxid: "88".repeat(32), state: "CLOSED", lockedFundingTxids: [DF_SPLICE] },
+  ];
+  const moved = fixture({
+    ...routes,
+    "GET /receive/requests": { requests: f.storedRequests },
+  });
+  assert.deepEqual(await seenBy(moved.client), ["completed", "completed"]);
+
+  // The channel is gone from the list. The engine drops a channel only when
+  // it voids or abandons it, and a zero-conf open the payer double-spent locks
+  // first: its record keeps lockedAt for money that never arrived, so that
+  // alone is not a completed payment.
   channels = [{ ...channel, fundingTxid: DF_OLD_FUNDING }];
   received = [dfPaid({ splice: false, lockedAt: NOW })];
   const gone = fixture({
     ...routes,
     "GET /receive/requests": { requests: f.storedRequests },
   });
-  assert.deepEqual(await seenBy(gone.client), ["completed", "completed"]);
-  // Without it, the same payment cannot be shown as completed.
-  received = [dfPaid({ splice: false })];
-  const unknown = fixture({
-    ...routes,
-    "GET /receive/requests": { requests: f.storedRequests },
-  });
-  assert.deepEqual(await seenBy(unknown.client), ["pending", "pending"]);
+  assert.deepEqual(await seenBy(gone.client), ["pending", "pending"]);
   // A reverted payment stays out, lockedAt or not.
   received = [dfPaid({ splice: false, status: "REVERTED", lockedAt: NOW })];
   const reverted = fixture({
