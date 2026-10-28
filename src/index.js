@@ -57,6 +57,12 @@ const FUNDING_LOCKED_STATES = new Set([
   "SHUTTING_DOWN",
   "NEGOTIATING_CLOSING",
 ]);
+// The fundings an engine (beignet 0.36.0+) recorded this channel as having
+// locked, kept through close. Empty from an older engine.
+const lockedFundings = (channel) =>
+  Array.isArray(channel?.lockedFundingTxids)
+    ? channel.lockedFundingTxids.filter((txid) => typeof txid === "string")
+    : [];
 let sequence = 0;
 const uid = () =>
   globalThis.crypto?.randomUUID?.() ??
@@ -411,6 +417,12 @@ function directFundingReceipts(value) {
       status: entry.status,
       amountSats: Number.isSafeInteger(amount) ? amount : null,
       paidAt: Number.isSafeInteger(entry.paidAt) && entry.paidAt > 0 ? entry.paidAt : null,
+      // When the engine saw the funding lock (beignet #1899, 0.36.0). It
+      // outlives the channel, so it still answers once the channel is gone.
+      lockedAt:
+        Number.isSafeInteger(entry.lockedAt) && entry.lockedAt > 0
+          ? entry.lockedAt
+          : null,
     });
   }
   return receipts;
@@ -418,13 +430,22 @@ function directFundingReceipts(value) {
 /**
  * Whether a channel's current funding has locked: true, false while the
  * channel is still setting up on it, or null when the channel list cannot say.
- * A disconnect, or a restart, puts a channel in AWAITING_REESTABLISH whatever
- * state it was in. The state it was in before, where the engine reports it
- * (beignet #1899), says which; so does a splice, in flight or adopted, since
- * one starts only from a locked channel and is adopted only once both sides
- * have sent splice_locked. A failed or closed channel may never have locked.
+ * The engine's own record of the fundings a channel locked
+ * (lockedFundingTxids, beignet #1899, 0.36.0) answers first, in any state: it
+ * is kept through close, and a funding it does not list is not known rather
+ * than unlocked. Without it, a disconnect, or a restart, puts a channel in
+ * AWAITING_REESTABLISH whatever state it was in. The state it was in before,
+ * where the engine reports it, says which; so does a splice, in flight or
+ * adopted, since one starts only from a locked channel and is adopted only
+ * once both sides have sent splice_locked. A failed or closed channel may
+ * never have locked.
  */
 function currentFundingLocked(channel) {
+  if (
+    typeof channel?.fundingTxid === "string" &&
+    lockedFundings(channel).includes(channel.fundingTxid)
+  )
+    return true;
   let state = channel?.state;
   if (state === "AWAITING_REESTABLISH") {
     if (
@@ -450,6 +471,11 @@ function currentFundingLocked(channel) {
 function fundingLocked(channels, txid) {
   let locked = false;
   for (const channel of Array.isArray(channels) ? channels : []) {
+    // The engine recorded this funding's lock, whatever the channel is now.
+    if (lockedFundings(channel).includes(txid)) {
+      locked = true;
+      continue;
+    }
     if (channel?.pendingSpliceTxid === txid) return false;
     if (channel?.fundingTxid === txid) {
       if (currentFundingLocked(channel) !== true) return false;
@@ -466,7 +492,10 @@ function fundingLocked(channels, txid) {
  * A request's status from the direct-funding payment that paid it, or null
  * when none did or its splice was reverted (wallet-core #38). The payer funded
  * this wallet's channel, which settles no invoice and pays no address. It is
- * pending while that splice or open locks, and completed once it has.
+ * pending while that splice or open locks, and completed once it has: once the
+ * engine's record of the payment has a lockedAt (beignet #1899, 0.36.0), which
+ * answers even after the channel has closed or left the list, or once the
+ * channel list shows the funding locked.
  *
  * Null too when the amount is not known: an open-amount request the engine
  * recorded no amount for (one paid before it kept them) is not shown, and so
@@ -485,7 +514,8 @@ function directFundingStatus(request, receipts, channels) {
     }
   }
   if (!Number.isSafeInteger(amount) || amount <= 0) return null;
-  const locked = fundingLocked(channels, receipt.fundingTxid);
+  const locked =
+    receipt.lockedAt != null || fundingLocked(channels, receipt.fundingTxid);
   return {
     phase: locked ? "completed" : "pending",
     receivedSats: amount,

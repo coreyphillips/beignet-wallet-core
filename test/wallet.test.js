@@ -1904,6 +1904,77 @@ test("a direct-funding open is not completed by a disconnect, or a close, before
   );
 });
 
+test("an engine's record of the lock keeps a direct-funding payment completed through a disconnect, a close, or the channel leaving the list (beignet #1899)", async () => {
+  // The engine (beignet 0.36.0+) records the fundings a channel locked, kept
+  // through close, and when a received payment's funding locked.
+  const opened = (state, extra = {}) => [
+    { ...channel, fundingTxid: DF_OLD_FUNDING },
+    { ...channel, channelId: "opened", htlcUsable: false, fundingTxid: DF_SPLICE, state, ...extra },
+  ];
+  let channels = opened("AWAITING_CHANNEL_READY");
+  let received = [dfPaid({ splice: false })];
+  const routes = {
+    "/direct-funding/request": dfOffer(),
+    "/direct-funding/received": () => received,
+    "/channels": () => channels,
+  };
+  const f = fixture(routes);
+  const request = await f.client.receive(
+    await f.client.quoteReceive({ amountSats: 10000 }),
+  );
+  const seenBy = async (client) => {
+    const row = (await client.snapshot()).activity.find(
+      (entry) => entry.paymentHash === request.paymentHash,
+    );
+    const status = await client.getReceiveStatus(request);
+    return [row.status, status.phase];
+  };
+  // A lock record for some other funding says nothing about this one.
+  channels = opened("AWAITING_CHANNEL_READY", { lockedFundingTxids: ["77".repeat(32)] });
+  assert.deepEqual(await seenBy(f.client), ["pending", "pending"]);
+
+  // Each of these read as pending from the state alone (wallet-core #40):
+  // with the funding listed as locked, each is completed.
+  for (const [state, extra] of [
+    ["AWAITING_REESTABLISH", {}],
+    ["FORCE_CLOSED", {}],
+    ["CLOSED", {}],
+    ["ERRORED", {}],
+  ]) {
+    channels = opened(state, { ...extra, lockedFundingTxids: [DF_SPLICE] });
+    const relaunched = fixture({
+      ...routes,
+      "GET /receive/requests": { requests: f.storedRequests },
+    });
+    assert.deepEqual(await seenBy(relaunched.client), ["completed", "completed"], state);
+  }
+
+  // The channel is gone from the list (a zero-conf open voided, or a row the
+  // engine deleted): the receipt's own lockedAt still answers.
+  channels = [{ ...channel, fundingTxid: DF_OLD_FUNDING }];
+  received = [dfPaid({ splice: false, lockedAt: NOW })];
+  const gone = fixture({
+    ...routes,
+    "GET /receive/requests": { requests: f.storedRequests },
+  });
+  assert.deepEqual(await seenBy(gone.client), ["completed", "completed"]);
+  // Without it, the same payment cannot be shown as completed.
+  received = [dfPaid({ splice: false })];
+  const unknown = fixture({
+    ...routes,
+    "GET /receive/requests": { requests: f.storedRequests },
+  });
+  assert.deepEqual(await seenBy(unknown.client), ["pending", "pending"]);
+  // A reverted payment stays out, lockedAt or not.
+  received = [dfPaid({ splice: false, status: "REVERTED", lockedAt: NOW })];
+  const reverted = fixture({
+    ...routes,
+    "GET /receive/requests": { requests: f.storedRequests },
+  });
+  const status = await reverted.client.getReceiveStatus(request);
+  assert.notEqual(status.method, "direct-funding");
+});
+
 test("a direct-funding splice that locked stays completed across a restart with no ledger (wallet-core #42)", async () => {
   let channels = dfLocked;
   const routes = {
@@ -3180,6 +3251,10 @@ test("funding transfer history follows channel readiness without regressing comp
     // state this wallet does not know.
     [{ ...away("A_LATER_STATE"), previousFundingTxids: ["aa".repeat(32)] }, false, "completed"],
     [away("A_LATER_STATE"), false, "completed"],
+    // The engine's record of the lock (beignet #1899) answers before the
+    // state: a funding it lists is locked even where the state says waiting.
+    [{ ...away("AWAITING_CHANNEL_READY"), lockedFundingTxids: [txid] }, false, "completed"],
+    [{ state: "AWAITING_CHANNEL_READY", lockedFundingTxids: ["aa".repeat(32)] }, false, "pending"],
   ]) {
     const state = JSON.stringify(fields);
     const rows = mergeActivity({
