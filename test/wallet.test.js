@@ -6,6 +6,7 @@ import {
   DemoWalletClient,
   DEFAULT_PRIMARY_URI,
   LIGHTNING_FEE_HEADROOM_SATS,
+  MAX_FEE_RATE,
   parseSats,
   parsePayment,
   btcStringToSats,
@@ -618,6 +619,10 @@ test("address payments quote and submit one splice-out; settlement remains pendi
   });
   assert.equal(review.route, "bitcoin");
   assert.equal(review.feeSats, 225);
+  // Priced at the engine's normal; the fixture names no other target, so
+  // every mark takes normal's figure.
+  assert.equal(review.feeRate, 2);
+  assert.deepEqual(review.feeRates, { fast: 2, normal: 2, slow: 2, minimum: 2 });
   assert.deepEqual(calls.find((c) => c.path === "/channel/splice-quote").body, {
     channelId: "channel-1",
     direction: "out",
@@ -635,6 +640,145 @@ test("address payments quote and submit one splice-out; settlement remains pendi
     quotedFeeSats: 225,
     description: "",
   });
+});
+
+const SPLICE_QUOTE = (c) => c.path === "/channel/splice-quote";
+const SPLICE_OUT = (c) => c.path === "/channel/splice-out";
+
+test("an address payment is priced at the fee rate given, reports it with the engine's estimates, and is sent at it", async () => {
+  const { client, calls } = fixture({
+    "/fees/estimates": { fast: 8, normal: 2, slow: 1, minimum: 1 },
+  });
+  const review = await client.prepareSend({
+    request: ADDRESS,
+    amountSats: 10000,
+    feeRate: 5,
+  });
+  assert.equal(review.route, "bitcoin");
+  assert.equal(review.feeRate, 5);
+  assert.deepEqual(review.feeRates, { fast: 8, normal: 2, slow: 1, minimum: 1 });
+  assert.equal(calls.find(SPLICE_QUOTE).body.feeratePerkw, 1250);
+  const sent = await client.send(review);
+  assert.equal(sent.status, "pending");
+  assert.equal(calls.find(SPLICE_OUT).body.feeratePerkw, 1250);
+  assert.equal(calls.find(SPLICE_OUT).body.quotedFeeSats, 225);
+});
+
+test("a fee rate that is not a whole number from 1 to 400 is refused before the engine is asked, whatever the route", async () => {
+  const engine = (c) =>
+    ["/fees/estimates", "/channel/splice-quote", "/invoice/decode", "/channels"].includes(c.path);
+  for (const feeRate of [0, -1, 1.5, 401, "3", NaN, Infinity]) {
+    const { client, calls } = fixture();
+    await assert.rejects(
+      client.prepareSend({ request: ADDRESS, amountSats: 1000, feeRate }),
+      { code: "INVALID_FEE_RATE" },
+    );
+    await assert.rejects(client.prepareSend({ request: INVOICE, feeRate }), {
+      code: "INVALID_FEE_RATE",
+    });
+    await assert.rejects(client.quoteMax({ request: ADDRESS, feeRate }), {
+      code: "INVALID_FEE_RATE",
+    });
+    assert.equal(calls.some(engine), false, String(feeRate));
+  }
+  const { client } = fixture();
+  assert.equal(MAX_FEE_RATE, 400);
+  assert.equal((await client.prepareSend({ request: ADDRESS, amountSats: 1000, feeRate: 400 })).feeRate, 400);
+});
+
+test("a fee rate given for a Lightning invoice is ignored: the invoice prices itself", async () => {
+  const { client, calls } = fixture();
+  const review = await client.prepareSend({ request: INVOICE, feeRate: 50 });
+  assert.equal(review.route, "lightning");
+  assert.equal(review.feeRate, undefined);
+  assert.equal(review.feeRates, undefined);
+  assert.equal(calls.some((c) => c.path === "/fees/estimates"), false);
+  assert.equal(calls.some(SPLICE_QUOTE), false);
+  assert.equal((await client.send(review)).status, "completed");
+});
+
+test("one sat per virtual byte is priced at the 253 sat/kw relay floor, chosen or estimated", async () => {
+  const chosen = fixture();
+  await chosen.client.prepareSend({ request: ADDRESS, amountSats: 10000, feeRate: 1 });
+  assert.equal(chosen.calls.find(SPLICE_QUOTE).body.feeratePerkw, 253);
+  const estimated = fixture({ "/fees/estimates": { normal: 1 } });
+  const review = await estimated.client.prepareSend({ request: ADDRESS, amountSats: 10000 });
+  assert.equal(review.feeRate, 1);
+  assert.equal(estimated.calls.find(SPLICE_QUOTE).body.feeratePerkw, 253);
+});
+
+test("estimates the engine leaves out or mangles take normal's figure, and none passes the splice ceiling", async () => {
+  const gaps = fixture({ "/fees/estimates": { normal: 3, fast: "x", slow: 0 } });
+  const review = await gaps.client.prepareSend({ request: ADDRESS, amountSats: 10000 });
+  assert.deepEqual(review.feeRates, { fast: 3, normal: 3, slow: 3, minimum: 3 });
+  assert.equal(gaps.calls.find(SPLICE_QUOTE).body.feeratePerkw, 750);
+  const high = fixture({ "/fees/estimates": { normal: 700, fast: 900, slow: 500, minimum: 401 } });
+  const capped = await high.client.prepareSend({ request: ADDRESS, amountSats: 10000 });
+  assert.equal(capped.feeRate, 400);
+  assert.deepEqual(capped.feeRates, { fast: 400, normal: 400, slow: 400, minimum: 400 });
+  assert.equal(high.calls.find(SPLICE_QUOTE).body.feeratePerkw, 100000);
+  await assert.rejects(
+    fixture({ "/fees/estimates": { fast: 8 } }).client.prepareSend({ request: ADDRESS, amountSats: 10000 }),
+    { code: "INVALID_AMOUNT" },
+  );
+});
+
+test("a max address payment at a chosen rate is priced again at that rate as it goes, not at the engine's normal", async () => {
+  let moved = false;
+  const { client, calls } = fixture({
+    "/fees/estimates": () => ({ normal: moved ? 9 : 2 }),
+    "/channel/splice-quote": (body) => ({ feeSats: body.feeratePerkw / 5, maxAmountSats: 180000 }),
+  });
+  const review = await client.prepareSend({ request: ADDRESS, max: true, feeRate: 6 });
+  assert.equal(review.feeRate, 6);
+  assert.equal(review.feeSats, 300);
+  assert.equal(review.amountSats, 180000);
+  moved = true;
+  const sent = await client.send(review);
+  assert.equal(sent.status, "pending");
+  assert.deepEqual(calls.filter(SPLICE_QUOTE).map((c) => c.body.feeratePerkw), [1500, 1500]);
+  assert.equal(calls.filter((c) => c.path === "/fees/estimates").length, 1);
+  assert.equal(calls.find(SPLICE_OUT).body.feeratePerkw, 1500);
+  // The same rate rides a max quote, so a max chip matches the review it leads to.
+  const quoted = await client.quoteMax({ request: ADDRESS, feeRate: 6 });
+  assert.equal(quoted.amountSats, 180000);
+  assert.equal(calls.filter(SPLICE_QUOTE).at(-1).body.feeratePerkw, 1500);
+});
+
+test("a max address payment at the default rate is still priced again at the engine's current normal", async () => {
+  let moved = false;
+  const { client, calls } = fixture({
+    "/fees/estimates": () => ({ normal: moved ? 1 : 2 }),
+  });
+  const review = await client.prepareSend({ request: ADDRESS, max: true });
+  assert.equal(review.feeRate, 2);
+  moved = true;
+  assert.equal((await client.send(review)).status, "pending");
+  assert.deepEqual(calls.filter(SPLICE_QUOTE).map((c) => c.body.feeratePerkw), [500, 253]);
+  assert.equal(calls.find(SPLICE_OUT).body.feeratePerkw, 253);
+});
+
+test("the demo prices an address at the rate given, reports its estimates, and sends the rated review", async () => {
+  const client = new DemoWalletClient();
+  const review = await client.prepareSend({ request: ADDRESS, amountSats: 1000 });
+  assert.equal(review.feeSats, 350);
+  assert.equal(review.feeRate, 3);
+  assert.deepEqual(review.feeRates, { fast: 4, normal: 3, slow: 2, minimum: 1 });
+  for (const [feeRate, feeSats] of [[1, 118], [2, 233], [3, 350], [4, 466]]) {
+    const rated = await client.prepareSend({ request: ADDRESS, amountSats: 1000, feeRate });
+    assert.equal(rated.feeSats, feeSats);
+    assert.equal(rated.feeRate, feeRate);
+    assert.equal(rated.totalSats, 1000 + feeSats);
+  }
+  assert.equal((await client.quoteMax({ request: ADDRESS, feeRate: 4 })).amountSats, 284650 - 466);
+  await assert.rejects(client.prepareSend({ request: ADDRESS, amountSats: 1000, feeRate: 0 }), {
+    code: "INVALID_FEE_RATE",
+  });
+  const invoice = await client.prepareSend({ request: INVOICE, feeRate: 4 });
+  assert.equal(invoice.feeRate, undefined);
+  const rated = await client.prepareSend({ request: ADDRESS, amountSats: 1000, feeRate: 4 });
+  const sent = await client.send(rated);
+  assert.equal(sent.feeSats, 466);
 });
 
 test("a lost payment response is uncertain, recorded locally, never retried or paid on another route", async () => {
@@ -4234,6 +4378,25 @@ test("a request with a direct-funding envelope is paid as direct funding when a 
   );
   assert.equal(row.status, "pending");
   assert.equal(row.title, "Direct funding sent");
+});
+
+test("a fee rate given for a direct-funding payment is ignored: its fee is the fixed ceiling", async () => {
+  const { client, calls } = embeddedFixture({
+    "/utxos": CONFIRMED_COIN,
+    "/direct-funding/send": {
+      offerId: "of".repeat(16),
+      status: "SIGNED_PENDING",
+      fundingTxid: "ef".repeat(32),
+      amountSat: 10000,
+    },
+  });
+  const review = await client.prepareSend({ request: FUNDING_URI(), feeRate: 50 });
+  assert.equal(review.method, "direct-funding");
+  assert.equal(review.feeSats, 1000);
+  assert.equal(review.feeRate, undefined);
+  assert.equal(review.feeRates, undefined);
+  assert.ok(!calls.some((c) => c.path === "/channel/splice-quote"));
+  assert.equal((await client.send(review)).status, "pending");
 });
 
 test("without a covering confirmed coin the same request pays the address by splice-out", async () => {

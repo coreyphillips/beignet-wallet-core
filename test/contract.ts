@@ -4,6 +4,7 @@ import {
   WalletClient,
   type WalletClientInterface,
   type Activity,
+  type FeeRates,
   type Connection,
   type SendResult,
   type ReceiveStatus,
@@ -54,6 +55,16 @@ async function verifyContract(
   const exactBudget: string | undefined = maxReview.debitMsat;
   void kept;
   void exactBudget;
+  const rated = await client.prepareSend({
+    request: receive.address!,
+    amountSats: 1000,
+    feeRate: 3,
+  });
+  const rate: number | undefined = rated.feeRate;
+  const marks: FeeRates | undefined = rated.feeRates;
+  void rate;
+  void marks;
+  void (await client.quoteMax({ request: receive.address!, feeRate: 3 }));
   return client.send(review);
 }
 const localClient: WalletClientInterface = new EmbeddedWalletClient({

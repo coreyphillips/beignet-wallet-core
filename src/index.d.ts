@@ -133,6 +133,23 @@ export interface SendInput {
   request: string;
   amountSats?: number | string | null;
   max?: boolean;
+  /**
+   * Whole sats per virtual byte for a payment to a Bitcoin address, 1 to
+   * MAX_FEE_RATE. Ignored on the Lightning, direct-funding and drain routes,
+   * which price themselves.
+   */
+  feeRate?: number;
+}
+export interface MaxInput {
+  request: string;
+  feeRate?: number;
+}
+/** The engine's estimates when a Bitcoin review was priced, whole sats per virtual byte. */
+export interface FeeRates {
+  fast: number;
+  normal: number;
+  slow: number;
+  minimum: number;
 }
 export type KeptReason = "none" | "reserve" | "commitment-cost" | "unavailable";
 export interface MaxQuote {
@@ -196,6 +213,10 @@ export interface SendReview {
   /** Present when a Bitcoin route pays a direct-funding request instead of the address. */
   method?: "direct-funding" | "drain";
   drain?: DrainProgress;
+  /** A Bitcoin splice only: the rate the quote was priced at, the one given or the engine's normal. */
+  feeRate?: number;
+  /** A Bitcoin splice only: the engine's estimates at quote time, for choosing another rate. */
+  feeRates?: FeeRates;
   expiresAt: number;
   warnings: string[];
 }
@@ -408,7 +429,7 @@ export interface WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
-  quoteMax(input: { request: string }): Promise<MaxQuote>;
+  quoteMax(input: MaxInput): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   prepareDrain(input: DrainInput): Promise<SendReview>;
   getDrain(requestId: string): Promise<DrainProgress>;
@@ -462,7 +483,7 @@ export class WalletClient implements WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
-  quoteMax(input: { request: string }): Promise<MaxQuote>;
+  quoteMax(input: MaxInput): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   prepareDrain(input: DrainInput): Promise<SendReview>;
   getDrain(requestId: string): Promise<DrainProgress>;
@@ -492,7 +513,7 @@ export class DemoWalletClient implements WalletClientInterface {
   listWallets(): Promise<WalletRecord[]>;
   createWallet(input?: CreateWalletInput): Promise<CreatedWallet>;
   snapshot(): Promise<WalletSnapshot>;
-  quoteMax(input: { request: string }): Promise<MaxQuote>;
+  quoteMax(input: MaxInput): Promise<MaxQuote>;
   prepareSend(input: SendInput): Promise<SendReview>;
   prepareDrain(input: DrainInput): Promise<SendReview>;
   getDrain(requestId: string): Promise<DrainProgress>;
@@ -515,6 +536,8 @@ export const DEFAULT_PRIMARY_URI: string;
 export const DEFAULT_HOST_URL: string;
 /** Routing fee a Lightning send may pay above the estimate. */
 export const LIGHTNING_FEE_HEADROOM_SATS: number;
+/** The highest fee rate a splice takes, in sats per virtual byte. */
+export const MAX_FEE_RATE: number;
 export function parseSats(input: string | number): number;
 export function formatSats(input: number): string;
 export function validatePrimaryUri(input: string): string;
