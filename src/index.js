@@ -175,6 +175,43 @@ function requirePrimary(rec, peers) {
 }
 const amountOptional = (value) =>
   value == null || value === "" ? null : positiveSats(value);
+/** The engine prices a splice at up to 100,000 sat/kw: 400 sats per virtual byte. */
+export const MAX_FEE_RATE = 400;
+// A fee rate the caller chose, in whole sats per virtual byte within what a
+// splice can take, or null for the engine's own estimate.
+const feeRateOptional = (value) => {
+  if (value == null) return null;
+  requires(
+    Number.isSafeInteger(value) && value >= 1 && value <= MAX_FEE_RATE,
+    `Choose a fee rate from 1 to ${MAX_FEE_RATE} sats per virtual byte.`,
+    "INVALID_FEE_RATE",
+  );
+  return value;
+};
+// Sats per virtual byte as a splice is priced, in sat/kw. 1 sat/vB is 250,
+// under the relay floor the engine's own conversion keeps at 253; a splice
+// priced below it risks the peer refusing it, so it is floored here too.
+const perkw = (feeRate) => Math.max(253, feeRate * 250);
+// The engine's estimates in whole sat/vB, each within what a splice takes.
+// A target the engine left out or mangled takes normal's figure, so the four
+// are complete whenever normal is, and normal must be: the quote is priced
+// from it.
+function feeRatesOf(fees) {
+  const normal = Math.min(positiveSats(fees?.normal), MAX_FEE_RATE);
+  const rate = (value) => {
+    try {
+      return Math.min(positiveSats(value), MAX_FEE_RATE);
+    } catch {
+      return normal;
+    }
+  };
+  return {
+    fast: rate(fees?.fast),
+    normal,
+    slow: rate(fees?.slow),
+    minimum: rate(fees?.minimum),
+  };
+}
 const text = (value) => (typeof value === "string" ? value : "");
 const boundedDescription = (value) => text(value).trim().slice(0, 256);
 const receiveFee = (amount, flat, ppm) =>
@@ -1922,8 +1959,8 @@ export class WalletClient {
       return null;
     }
   }
-  async quoteMax({ request } = {}) {
-    const review = await this._prepareSend({ request, max: true }, false);
+  async quoteMax({ request, feeRate } = {}) {
+    const review = await this._prepareSend({ request, max: true, feeRate }, false);
     return { amountSats: review.amountSats, keptSats: review.keptSats, keptReason: review.keptReason };
   }
   async prepareSend(input = {}) {
@@ -2014,7 +2051,7 @@ export class WalletClient {
         status === "failed" ? problem?.message || "The wallet drain was cancelled." :
         "The wallet drain is pending. Follow its progress in Activity before sending again." };
   }
-  async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
+  async _prepareSend({ request, amountSats, max = false, feeRate } = {}, holdReview) {
     const epoch = this._epoch;
     const rec = await this._record();
     const parsed = parsePayment(request, {
@@ -2039,6 +2076,10 @@ export class WalletClient {
       "This payment request fixes its amount. Send that amount instead.", "MAX_FIXED_AMOUNT");
     requires(!max || typed == null,
       "Choose either an amount or send max.", "AMOUNT_CONFLICT");
+    // Checked whatever the route: a rate outside what a splice can take is
+    // the caller's mistake, not the engine's answer. Only a payment to a
+    // Bitcoin address is priced by it; the other routes price themselves.
+    const chosen = feeRateOptional(feeRate);
     // A request from another Beignet wallet may carry a direct-funding
     // envelope: one of this wallet's confirmed coins becomes the recipient's
     // channel funding directly, in one transaction. It takes a whole confirmed
@@ -2076,6 +2117,7 @@ export class WalletClient {
     let route;
     let paymentHash;
     let maxDetails;
+    let rated;
     let expiresAt = this._now() + 60000;
     if (target.kind === "bolt11") {
       const decoded = await this._post(
@@ -2282,8 +2324,11 @@ export class WalletClient {
           "Update your wallet engine to send before channel funding confirms, or wait for its first confirmation. Lightning sends work now.",
           "FUNDING_UNCONFIRMED");
       }
-      const feeRate = positiveSats(fees.normal);
-      const feeratePerkw = feeRate * 250;
+      // Priced at the rate the payer chose, else the engine's normal.
+      const rates = feeRatesOf(fees);
+      const rate = chosen ?? rates.normal;
+      const feeratePerkw = perkw(rate);
+      rated = { feeRate: rate, feeRates: rates };
       const quote = await this._post(
         "/channel/splice-quote",
         { channelId: home.channelId, direction: "out", feeratePerkw, address: destination },
@@ -2331,6 +2376,7 @@ export class WalletClient {
       ...(estimatedFeeSats != null ? { estimatedFeeSats } : {}),
       totalSats: maxDetails?.debitSats ?? amount + feeSats,
       ...maxDetails,
+      ...rated,
       route,
       expiresAt,
       warnings,
@@ -2341,6 +2387,9 @@ export class WalletClient {
       path,
       body,
       paymentHash,
+      // Only a rate the payer chose is held: a max sent at the default is
+      // priced again at the engine's normal of the moment, as before.
+      ...(rated && chosen != null ? { feeRate: chosen } : {}),
     });
     return review;
   }
@@ -2375,8 +2424,12 @@ export class WalletClient {
         "ALREADY_SUBMITTED",
       );
     if (held.review.max && held.path === "/channel/splice-out") {
-      const fees = await this._get("/fees/estimates");
-      const feeratePerkw = positiveSats(fees.normal) * 250;
+      // Priced again as it goes: at the rate the payer chose, which is then
+      // the rate paid, or at the engine's current normal when the review
+      // took the default.
+      const feeratePerkw = perkw(
+        held.feeRate ?? feeRatesOf(await this._get("/fees/estimates")).normal,
+      );
       const quote = await this._post("/channel/splice-quote", {
         channelId: held.body.channelId, direction: "out", feeratePerkw,
         address: held.body.address,
@@ -3643,6 +3696,10 @@ export class WalletClient {
 }
 
 // Preview runs wholly in memory and never touches a transport or real wallet.
+// The preview's fee estimates, whole sats per virtual byte, and the weight
+// of its splice: about 117 vB, so 350 sats at the preview's normal rate.
+const DEMO_FEE_RATES = { fast: 4, normal: 3, slow: 2, minimum: 1 };
+const DEMO_SPLICE_WEIGHT = 466;
 export class DemoWalletClient {
   constructor() {
     this.demo = true;
@@ -3788,8 +3845,8 @@ export class DemoWalletClient {
       demo: true,
     };
   }
-  async quoteMax({ request } = {}) {
-    const review = await this._prepareSend({ request, max: true }, false);
+  async quoteMax({ request, feeRate } = {}) {
+    const review = await this._prepareSend({ request, max: true, feeRate }, false);
     return { amountSats: review.amountSats, keptSats: review.keptSats, keptReason: review.keptReason };
   }
   async prepareSend(input = {}) {
@@ -3835,7 +3892,7 @@ export class DemoWalletClient {
     this._sendReviews.delete(requestId);
     return clone(progress);
   }
-  async _prepareSend({ request, amountSats, max = false } = {}, holdReview) {
+  async _prepareSend({ request, amountSats, max = false, feeRate } = {}, holdReview) {
     const parsed = parsePayment(request, { network: this.wallet.network });
     const preview = ["demo", "demo:coffee"].includes(
       text(request).trim().toLowerCase(),
@@ -3852,6 +3909,10 @@ export class DemoWalletClient {
       "This payment request fixes its amount. Send that amount instead.", "MAX_FIXED_AMOUNT");
     requires(!max || typed == null,
       "Choose either an amount or send max.", "AMOUNT_CONFLICT");
+    // Checked whatever the route: a rate outside what a splice can take is
+    // the caller's mistake, not the engine's answer. Only a payment to a
+    // Bitcoin address is priced by it; the other routes price themselves.
+    const chosen = feeRateOptional(feeRate);
     requires(
       fixed == null || typed == null || fixed === typed,
       "The entered amount differs from the payment request.",
@@ -3859,8 +3920,11 @@ export class DemoWalletClient {
     );
     const route =
       parsed.kind === "onchain" && !parsed.lightning ? "bitcoin" : "lightning";
+    const rate = chosen ?? DEMO_FEE_RATES.normal;
     let amount = max ? this._balance : positiveSats(fixed ?? typed ?? (preview ? 4200 : null));
-    const feeSats = route === "bitcoin" ? 350 : max
+    const feeSats = route === "bitcoin"
+      ? Math.ceil((DEMO_SPLICE_WEIGHT * perkw(rate)) / 1000)
+      : max
       ? Math.min(Math.max(50, Math.ceil(amount / 100)), Math.max(0, amount - 1))
       : Math.max(1, Math.ceil(amount * 0.0005));
     if (max) amount = positiveSats(amount - feeSats);
@@ -3884,6 +3948,9 @@ export class DemoWalletClient {
         ...(route === "lightning" ? { minRecipientSats: amount, maxFeeSats: feeSats,
           debitSats: this._balance, debitMsat: (BigInt(this._balance) * 1000n).toString(),
           maxFeeMsat: (BigInt(feeSats) * 1000n).toString() } : {}) } : {}),
+      ...(route === "bitcoin"
+        ? { feeRate: rate, feeRates: { ...DEMO_FEE_RATES } }
+        : {}),
       route,
       expiresAt: Date.now() + 60000,
       warnings: ["Preview only. No real money will move."],
