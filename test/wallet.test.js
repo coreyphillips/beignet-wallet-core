@@ -1376,6 +1376,84 @@ test("automatic funding is displayed as an internal transfer while explicit send
   );
 });
 
+test("a transaction the engine reports dropped is failed, not pending for good (beignet-umbrel #285)", () => {
+  // The losing version of a cooperative close: the other signed version
+  // confirmed, so this one never will, and it read as waiting for a block.
+  const received = (txid, extra) => ({
+    txid,
+    type: "received",
+    valueSats: 979,
+    feeSats: 141,
+    confirmed: false,
+    timestamp: NOW,
+    ...extra,
+  });
+  const rows = new Map(
+    mergeActivity({
+      transactions: [
+        received("gone", { dropped: true }),
+        received("waiting"),
+        // A block outranks the flag.
+        received("mined", { dropped: true, confirmed: true, height: 100 }),
+      ],
+    }).map((row) => [row.txid, row]),
+  );
+  assert.equal(rows.get("gone").status, "failed");
+  assert.equal(rows.get("gone").dropped, true);
+  assert.equal(rows.get("gone").kind, "received");
+  assert.equal(rows.get("gone").amountSats, 979);
+  assert.equal(rows.get("waiting").status, "pending");
+  assert.equal(rows.get("mined").status, "completed");
+  for (const txid of ["waiting", "mined"])
+    assert.equal("dropped" in rows.get(txid), false, txid);
+});
+
+test("a snapshot shows a dropped receive as failed and leaves a dropped funding out of the opening balance", async () => {
+  const { client } = fixture({
+    "/balance": { onchain: 2000, lightning: 0, splicingSats: 0 },
+    "/channels": [
+      {
+        ...channel,
+        channelId: "opening",
+        state: "AWAITING_FUNDING_CONFIRMED",
+        htlcUsable: false,
+        localBalanceSats: 3000,
+        fundingTxid: "dropped-funding",
+      },
+    ],
+    "/transactions": [
+      {
+        txid: "dropped-funding",
+        type: "sent",
+        valueSats: -3000,
+        feeSats: 1,
+        confirmed: false,
+        timestamp: NOW,
+        dropped: true,
+      },
+      {
+        txid: "dropped-receive",
+        type: "received",
+        valueSats: 979,
+        feeSats: 141,
+        confirmed: false,
+        timestamp: NOW,
+        dropped: true,
+      },
+    ],
+  });
+  const snapshot = await client.snapshot();
+  assert.equal(snapshot.balance.pending.openingSats, 0);
+  assert.equal(snapshot.balance.totalSats, 2000);
+  const receive = snapshot.activity.find((row) => row.txid === "dropped-receive");
+  assert.equal(receive.status, "failed");
+  assert.equal(receive.dropped, true);
+  assert.equal(
+    snapshot.activity.find((row) => row.txid === "dropped-funding").status,
+    "failed",
+  );
+});
+
 test("durable host submissions survive reconnect and replace local tracking without duplicates", async () => {
   let submissions = [];
   const overrides = {

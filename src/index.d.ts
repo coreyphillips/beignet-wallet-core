@@ -74,6 +74,13 @@ export interface Activity {
   txid?: string;
   paymentHash?: string;
   address?: string;
+  /**
+   * Set, with status `failed`, on an on-chain transaction the engine reports
+   * as dropped: unconfirmed and gone from its server, because it was
+   * replaced, a conflicting spend of its inputs confirmed, or the mempool
+   * evicted it. It will not confirm and is not in the balance.
+   */
+  dropped?: true;
   receiveRequest?: ReceiveRequestDetails;
   receiveStatus?: ReceiveStatus;
   receiveStatusUnavailable?: boolean;
