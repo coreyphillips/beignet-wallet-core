@@ -459,6 +459,16 @@ function directFundingReceipts(value) {
   return receipts;
 }
 /**
+ * Whether the engine reports an on-chain transaction as dropped: unconfirmed,
+ * and gone from its server's mempool and blocks, because it was replaced, a
+ * conflicting spend of its inputs confirmed, or the mempool evicted it
+ * (beignet #1967, beignet-umbrel #285). It will not confirm, so it is not
+ * pending. A confirmation outranks the flag.
+ */
+function isDropped(tx) {
+  return tx?.dropped === true && !tx.confirmed;
+}
+/**
  * Whether a channel's current funding has locked: true, false while the
  * channel is still setting up on it, or null when the channel list cannot say.
  * The engine's own record of the fundings a channel locked
@@ -666,6 +676,7 @@ export function mergeActivity(
   }
   for (const tx of transactions) {
     if (!tx.txid) continue;
+    const dropped = isDropped(tx);
     const internal = fundingTxids.has(tx.txid) && !explicitSends.has(tx.txid);
     const kind = internal
       ? "transfer"
@@ -689,14 +700,16 @@ export function mergeActivity(
         tx.feeSats == null ? 0 : integerField(tx.feeSats, "transaction fee"),
       feeKnown: tx.feeSats != null,
       feeEstimated: false,
-      status:
-        tx.confirmed && !(internal && lockingTxids.has(tx.txid))
+      status: dropped
+        ? "failed"
+        : tx.confirmed && !(internal && lockingTxids.has(tx.txid))
           ? "completed"
           : "pending",
       timestamp: asTime(tx.confirmTimestamp || tx.timestamp),
       reference: tx.txid,
       txid: tx.txid,
       ...(tx.address ? { address: tx.address } : {}),
+      ...(dropped ? { dropped: true } : {}),
     });
   }
   return [...rows.values()].sort(
@@ -1641,7 +1654,10 @@ export class WalletClient {
     });
     // Canonical Lightning already includes disconnected/restore-held NORMAL balances;
     // splicingSats is a separate daemon bucket. Only add genuinely funded openings.
-    const observedTransactions = new Set(transactions.map((tx) => tx.txid));
+    // A dropped funding will not confirm, so its channel is not opening on it.
+    const observedTransactions = new Set(
+      transactions.filter((tx) => !isDropped(tx)).map((tx) => tx.txid),
+    );
     // A disconnected opening is not in the Lightning balance either, so it
     // counts here too where the channel list says it is one.
     const openingSats = channels
