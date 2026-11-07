@@ -24,14 +24,47 @@ export const CHANNELIZE_RETRY_MS = 2 * 60 * 1000;
 const CLOSED = new Set(['CLOSED', 'FORCE_CLOSED']);
 const usable = (c) => (c.htlcUsable != null ? !!c.htlcUsable : c.state === 'NORMAL');
 
-/** The wallet's channels with its primary, live ones only. */
-export function primaryChannels(channels, primaryPubkey) {
-	return (channels || []).filter((c) => c.peerPubkey === primaryPubkey && !CLOSED.has(c.state));
+/**
+ * The primaries' pubkeys a record names: the ranked list when the engine
+ * ranks several (coreyphillips/beignet#1924), else the one scalar primary.
+ */
+export function primaryKeys(lf) {
+	if (!lf) return [];
+	if (Array.isArray(lf.primaries) && lf.primaries.length > 0)
+		return lf.primaries.map((p) => p.pubkey).filter((k) => typeof k === 'string');
+	return lf.primaryPubkey ? [lf.primaryPubkey] : [];
 }
 
-/** The one usable channel with the primary, or null. */
+/**
+ * The peers a wallet still holds channels with that are not ranked primaries:
+ * the engine's `retainedPeers`, else the one previous primary a manager
+ * recorded when the primary was re-pointed.
+ */
+export function retainedKeys(lf) {
+	if (!lf) return [];
+	if (Array.isArray(lf.retainedPeers))
+		return lf.retainedPeers.map((p) => p && p.pubkey).filter((k) => typeof k === 'string');
+	return lf.previousPrimary && lf.previousPrimary.pubkey ? [lf.previousPrimary.pubkey] : [];
+}
+
+const keySet = (primaryPubkey) =>
+	new Set(Array.isArray(primaryPubkey) ? primaryPubkey : primaryPubkey ? [primaryPubkey] : []);
+
+/** The wallet's channels with its primary (or any of several), live ones only. */
+export function primaryChannels(channels, primaryPubkey) {
+	const keys = keySet(primaryPubkey);
+	return (channels || []).filter((c) => keys.has(c.peerPubkey) && !CLOSED.has(c.state));
+}
+
+/**
+ * The one usable channel with the primary, or null. With several primaries
+ * the usable channel holding the largest local balance, so a send out of
+ * one channel leaves from the one that can carry the most.
+ */
 export function homeChannel(channels, primaryPubkey) {
-	return primaryChannels(channels, primaryPubkey).find(usable) || null;
+	const candidates = primaryChannels(channels, primaryPubkey).filter(usable);
+	if (!Array.isArray(primaryPubkey) || primaryPubkey.length <= 1) return candidates[0] || null;
+	return candidates.sort((a, b) => (b.localBalanceSats || 0) - (a.localBalanceSats || 0))[0] || null;
 }
 
 /**
@@ -40,6 +73,7 @@ export function homeChannel(channels, primaryPubkey) {
  * their balance is part of Total and must stay findable on the page.
  */
 export function previousPrimaryChannels(channels, previousPrimary) {
+	if (Array.isArray(previousPrimary)) return primaryChannels(channels, previousPrimary);
 	if (!previousPrimary || !previousPrimary.pubkey) return [];
 	return primaryChannels(channels, previousPrimary.pubkey);
 }
@@ -74,7 +108,10 @@ export function planInvoice({
 	primaryRunning = true,
 	primaryConnected = true
 }) {
-	if (setup !== 'ready' || !primaryPubkey) return { kind: 'refuse', code: 'NOT_READY' };
+	// `primaryPubkey` is one pubkey or the ranked list's; `primaryConnected`
+	// then says whether any primary a receive could go to is connected.
+	const keys = keySet(primaryPubkey);
+	if (setup !== 'ready' || keys.size === 0) return { kind: 'refuse', code: 'NOT_READY' };
 	const inbound = receivableSats(channels, primaryPubkey, previousPrimary);
 	const covered = wantedSats > 0 ? inbound >= wantedSats : inbound > 0;
 	if (covered) return { kind: 'plain' };
@@ -176,8 +213,11 @@ export function channelizeNote(status, now = Date.now()) {
 export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, peers }) {
 	const lf = (rec && rec.lfbw) || null;
 	const primaryPubkey = (lf && lf.primaryPubkey) || null;
-	const withPrimary = primaryChannels(channels, primaryPubkey);
-	const home = withPrimary.find(usable) || null;
+	// Every ranked primary's channels count as home channels; `primaryPubkey`
+	// stays rank 1, which is what the one-primary figures and gates read.
+	const primaries = primaryKeys(lf);
+	const withPrimary = primaryChannels(channels, primaries);
+	const home = homeChannel(channels, primaries);
 	const pendingChannels = withPrimary.filter((c) => !usable(c));
 
 	const onchain = balance ? balance.onchain || 0 : (info && info.onchainBalanceSats) || 0;
@@ -191,9 +231,10 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 		: home
 		? home.localBalanceSats || 0
 		: 0;
-	// Inbound on the previous primary's channel counts too: it receives until
-	// it is moved, and the invoice plan agrees (wallet-core #18).
-	const canReceive = receivableSats(channels, primaryPubkey, (lf && lf.previousPrimary) || null);
+	// Inbound on a retained peer's channel counts too: it receives until it
+	// is moved, and the invoice plan agrees (wallet-core #18).
+	const retained = retainedKeys(lf);
+	const canReceive = receivableSats(channels, primaries, retained);
 	const lightning = balance ? balance.lightning || 0 : (info && info.lightningBalanceSats) || 0;
 	const pending = unconfirmed + confirmedOnchain + openingSats + splicingSats;
 	const total = lightning + onchain + openingSats + splicingSats;
@@ -235,13 +276,17 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 		}
 	}
 
-	const primaryConnected = !!primaryPubkey && (peers || []).some((p) => p.pubkey === primaryPubkey && (p.state === 'connected' || p.state === 'ready' || p.connected === true));
+	const connected = (pubkey) =>
+		(peers || []).some((p) => p.pubkey === pubkey && (p.state === 'connected' || p.state === 'ready' || p.connected === true));
+	const primaryConnected = !!primaryPubkey && connected(primaryPubkey);
+	const connectedPrimaries = primaries.filter(connected);
+	const anyPrimaryConnected = connectedPrimaries.length > 0;
 
-	// Re-pointed primary: the channel with the old one stays open until it
-	// is moved, and it is listed here so its balance is not a figure the
-	// user cannot find (umbrel #86).
+	// Re-pointed or removed primary: the channel with the old one stays open
+	// until it is moved, and it is listed here so its balance is not a figure
+	// the user cannot find (umbrel #86).
 	const previousPrimary = (lf && lf.previousPrimary) || null;
-	const previousChannels = previousPrimaryChannels(channels, previousPrimary);
+	const previousChannels = previousPrimaryChannels(channels, retained);
 
 	return {
 		lf,
@@ -251,6 +296,10 @@ export function lfbwStatus({ rec, info, balance, liquidity, channels, utxos, pee
 		channels: withPrimary,
 		previousPrimary,
 		previousChannels,
+		primaries,
+		retainedPeers: retained,
+		connectedPrimaries,
+		anyPrimaryConnected,
 		total,
 		canSend,
 		canReceive,

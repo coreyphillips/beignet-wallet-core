@@ -5,6 +5,8 @@ import {
   lfbwStatus,
   planInvoice,
   homeChannel,
+  primaryKeys,
+  retainedKeys,
   arrivingFundsNote,
   channelizeNote,
   INBOUND_HEADROOM_SATS,
@@ -164,15 +166,25 @@ function keepPayAll(row, previous) {
       feeSats: previous.feeSats, feeKnown: previous.feeKnown, feeEstimated: previous.feeEstimated }
     : row;
 }
+const peerConnected = (peer) =>
+  peer.connected || peer.state === "connected" || peer.state === "ready";
+// A send needs a primary to be connected: the one primary, or with ranked
+// primaries any of them (a payment leaves through whichever has a route).
 function requirePrimary(rec, peers) {
-  const primary = rec.lfbw?.primaryPubkey;
+  const keys = primaryKeys(rec.lfbw);
   requires(
-    !primary || peers.some((peer) => peer.pubkey === primary &&
-      (peer.connected || peer.state === "connected" || peer.state === "ready")),
-    "Your primary node needs to reconnect before this wallet can send. Try again in a minute.",
+    keys.length === 0 || peers.some((peer) => keys.includes(peer.pubkey) && peerConnected(peer)),
+    keys.length > 1
+      ? "None of your primary nodes is connected, so this wallet cannot send right now. Try again in a minute."
+      : "Your primary node needs to reconnect before this wallet can send. Try again in a minute.",
     "PRIMARY_DOWN",
   );
 }
+const PUBKEY_RE = /^0[23][0-9a-f]{64}$/i;
+const validatePubkey = (value) => {
+  requires(typeof value === "string" && PUBKEY_RE.test(value), "Enter a node public key.", "INVALID_PARAMS");
+  return value.toLowerCase();
+};
 const amountOptional = (value) =>
   value == null || value === "" ? null : positiveSats(value);
 /** The engine prices a splice at up to 100,000 sat/kw: 400 sats per virtual byte. */
@@ -969,6 +981,188 @@ function publicOfflineAvailability(value) {
       ? { offlineReceiveReason: value.offlineReceiveReason === null ? null : value.offlineReceiveReason.slice(0, 512) } : {}),
   };
 }
+/**
+ * The ranked primaries a record mirrors (coreyphillips/beignet#1924), each
+ * sanitized like the scalar primary: a checked pubkey, bounded text, the
+ * fixed setup diagnostic and the offline-receive pair. Nothing for a record
+ * from an engine that keeps one primary, so such a record reads as before.
+ */
+function publicPrimaries(lf) {
+  if (!Array.isArray(lf?.primaries)) return {};
+  const primaries = lf.primaries
+    .filter((p) => p && PUBKEY_RE.test(text(p.pubkey)))
+    .map((p) => {
+      const setupError = publicSetupError(p.setupError);
+      return {
+        pubkey: text(p.pubkey).toLowerCase(),
+        uri: typeof p.uri === "string" ? p.uri.slice(0, 512) : null,
+        ...(p.fallbackUri === undefined
+          ? {}
+          : { fallbackUri: typeof p.fallbackUri === "string" ? p.fallbackUri.slice(0, 512) : null }),
+        ...(typeof p.trusted === "boolean" ? { trusted: p.trusted } : {}),
+        ...(typeof p.setup === "string" ? { setup: p.setup.slice(0, 32) } : {}),
+        ...(setupError ? { setupError } : {}),
+        ...(typeof p.connected === "boolean" ? { connected: p.connected } : {}),
+        ...publicOfflineAvailability(p),
+      };
+    });
+  const threshold = lf.primariesThresholdSat;
+  return {
+    primaries,
+    ...(threshold === null || (Number.isSafeInteger(threshold) && threshold >= 0)
+      ? { primariesThresholdSat: threshold }
+      : {}),
+    ...(lf.receiveTarget === null
+      ? { receiveTarget: null }
+      : PUBKEY_RE.test(text(lf.receiveTarget))
+        ? { receiveTarget: text(lf.receiveTarget).toLowerCase() }
+        : {}),
+    ...(Array.isArray(lf.retainedPeers)
+      ? {
+          retainedPeers: lf.retainedPeers
+            .filter((p) => p && PUBKEY_RE.test(text(p.pubkey)))
+            .map((p) => ({
+              pubkey: text(p.pubkey).toLowerCase(),
+              channelCount: Number.isSafeInteger(p.channelCount) && p.channelCount >= 0 ? p.channelCount : 0,
+              balanceSat: Number.isSafeInteger(p.balanceSat) && p.balanceSat >= 0 ? p.balanceSat : 0,
+            })),
+        }
+      : {}),
+  };
+}
+/**
+ * The engine's ranked list merged with what the record and the peer list
+ * know of each primary: the policy an app displays and edits. The engine's
+ * figures (rank, balance, channel count, receive order) are its own; the
+ * record supplies trust, fallback and setup; the peer list says who is
+ * connected; the device engine's offline summary says who serves offline
+ * receives.
+ */
+function mergedPolicy(policy, rec, peers, offline) {
+  requires(
+    policy && Array.isArray(policy.primaries),
+    "The wallet returned an invalid primaries list.",
+    "INVALID_RESPONSE",
+  );
+  const record = publicPrimaries(rec?.lfbw);
+  const entries = new Map((record.primaries || []).map((p) => [p.pubkey, p]));
+  const answers = new Map(
+    (Array.isArray(offline?.peers) ? offline.peers : [])
+      .filter((p) => p && typeof p.pubkey === "string")
+      .map((p) => [p.pubkey.toLowerCase(), p]),
+  );
+  const connected = (pubkey) =>
+    Array.isArray(peers) && peers.some((p) => p.pubkey === pubkey && peerConnected(p));
+  const primaries = policy.primaries
+    .filter((p) => p && PUBKEY_RE.test(text(p.pubkey)) && Number.isSafeInteger(p.rank) && p.rank >= 1)
+    .map((p) => {
+      const pubkey = text(p.pubkey).toLowerCase();
+      const entry = entries.get(pubkey);
+      const answer = answers.get(pubkey);
+      const isConnected = Array.isArray(peers) ? connected(pubkey) : entry?.connected === true;
+      return {
+        pubkey,
+        rank: p.rank,
+        uri:
+          entry?.uri ||
+          (typeof p.uri === "string" ? p.uri.slice(0, 512) : "") ||
+          (typeof p.host === "string" && Number.isSafeInteger(p.port) ? `${pubkey}@${p.host}:${p.port}` : ""),
+        fallbackUri: entry?.fallbackUri ?? null,
+        connected: isConnected,
+        setup: entry?.setup || (isConnected ? "ready" : "pending"),
+        ...(entry?.setupError ? { setupError: entry.setupError } : {}),
+        ...(typeof entry?.trusted === "boolean" ? { trusted: entry.trusted } : {}),
+        balanceSat: Number.isSafeInteger(p.balanceSat) && p.balanceSat >= 0 ? p.balanceSat : 0,
+        channelCount: Number.isSafeInteger(p.channelCount) && p.channelCount >= 0 ? p.channelCount : 0,
+        ...(typeof p.belowThreshold === "boolean" ? { belowThreshold: p.belowThreshold } : {}),
+        isReceiveTarget:
+          p.isReceiveTarget === true || (p.isReceiveTarget == null && policy.receiveTarget === pubkey),
+        selectionOrder: Number.isSafeInteger(p.selectionOrder) && p.selectionOrder >= 1 ? p.selectionOrder : p.rank,
+        ...publicOfflineAvailability(
+          answer
+            ? { offlineReceiveAvailable: answer.available, offlineReceiveReason: answer.reason }
+            : entry || {},
+        ),
+      };
+    })
+    .sort((a, b) => a.rank - b.rank);
+  return {
+    thresholdSat:
+      Number.isSafeInteger(policy.fillThresholdSat) && policy.fillThresholdSat >= 0
+        ? policy.fillThresholdSat
+        : null,
+    receiveTarget: PUBKEY_RE.test(text(policy.receiveTarget))
+      ? text(policy.receiveTarget).toLowerCase()
+      : null,
+    primaries,
+  };
+}
+/** The policy a stopped engine cannot answer, from the record's mirror alone: nothing connected, no figures. */
+function stoppedPolicy(rec) {
+  const record = publicPrimaries(rec?.lfbw);
+  const primaries = (record.primaries || []).map((p, i) => ({
+    pubkey: p.pubkey,
+    rank: i + 1,
+    uri: p.uri || "",
+    fallbackUri: p.fallbackUri ?? null,
+    connected: false,
+    setup: p.setup || "pending",
+    ...(p.setupError ? { setupError: p.setupError } : {}),
+    ...(typeof p.trusted === "boolean" ? { trusted: p.trusted } : {}),
+    balanceSat: 0,
+    channelCount: 0,
+    isReceiveTarget: i === 0,
+    selectionOrder: i + 1,
+    ...publicOfflineAvailability(p),
+  }));
+  return {
+    thresholdSat: record.primariesThresholdSat ?? null,
+    receiveTarget: primaries[0]?.pubkey ?? null,
+    primaries,
+  };
+}
+/** A channel-send stage as an activity status: locked is done, aborted or conflicted failed, anything else still going. */
+const channelSendStatus = (stage) =>
+  stage === "LOCKED" ? "completed"
+    : stage === "ABORTED" || stage === "CONFLICTED" ? "failed"
+    : typeof stage === "string" && stage ? "pending"
+    : "uncertain";
+/**
+ * The engine's composite channel sends as activity rows (coreyphillips/beignet#1922):
+ * one sent payment each, never the internal funding outputs the transaction
+ * also makes. The row's reference is the engine's record id, which is also
+ * what the submission row of the same send was recorded under, so the two
+ * read as one.
+ */
+function channelSendRows(sends, now) {
+  return (Array.isArray(sends) ? sends : [])
+    .filter((s) => s && s.kind === "composite" && typeof s.id === "string" && s.id)
+    .map((s) => {
+      const status = channelSendStatus(s.stage);
+      return {
+        id: `channel-send:${s.id}`,
+        kind: "sent",
+        title:
+          status === "completed" ? "Bitcoin sent"
+            : status === "failed" ? "Payment declined"
+            : status === "pending" ? "Bitcoin payment pending"
+            : "Payment result unknown",
+        description:
+          status === "failed" && text(s.reason) ? text(s.reason).slice(0, 200)
+            : text(s.address) ? `Paid out of several channels in one transaction.` : "",
+        amountSats: Number.isSafeInteger(s.amountSats) && s.amountSats >= 0 ? s.amountSats : 0,
+        feeSats: Number.isSafeInteger(s.feeSats) && s.feeSats >= 0 ? s.feeSats : 0,
+        feeKnown: true,
+        feeEstimated: status !== "completed",
+        status,
+        timestamp: Number.isFinite(s.startedAt) ? s.startedAt : now,
+        reference: s.id,
+        ...(text(s.txid) ? { txid: text(s.txid) } : {}),
+        ...(text(s.address) ? { address: text(s.address) } : {}),
+        channelSend: { kind: "composite", id: s.id, ...(text(s.stage) ? { stage: text(s.stage) } : {}) },
+      };
+    });
+}
 function publicReservation(value) {
   if (!value || typeof value.concurrent !== "boolean" || typeof value.state !== "string"
       || !Number.isSafeInteger(value.reservedInboundSats) || value.reservedInboundSats < 0
@@ -1003,6 +1197,7 @@ function publicWallet(rec) {
             ...(setupError ? { setupError } : {}),
             trusted: rec.lfbw.trusted,
             ...publicOfflineAvailability(rec.lfbw),
+            ...publicPrimaries(rec.lfbw),
             ...(rec.lfbw.unpairedFunding &&
             Number.isFinite(rec.lfbw.unpairedFunding.at)
               ? { unpairedFunding: { at: rec.lfbw.unpairedFunding.at } }
@@ -1466,24 +1661,43 @@ export class WalletClient {
         read("/graph/info"),
       ]);
     const primaryPubkey = rec.lfbw?.primaryPubkey || null;
-    const primaryPeer = Array.isArray(peers)
-      ? peers.find(p => p.pubkey === primaryPubkey &&
+    const connectedPeer = (pubkey) => Array.isArray(peers)
+      ? peers.find(p => p.pubkey === pubkey &&
           (p.state === "connected" || p.state === "ready" || p.connected === true))
       : null;
-    let primaryTransport = null;
-    if (primaryPeer?.transport === "iroh") {
-      const path = primaryPeer.iroh?.path;
-      primaryTransport = path === "direct" || path === "relay" ? `iroh-${path}` : "iroh-unknown";
-    } else if (primaryPeer) {
-      const onion = primaryPeer.host?.endsWith(".onion") ||
-        (rec.lfbw?.primaryUri?.includes("@iroh:") && rec.lfbw?.primaryFallbackUri);
-      primaryTransport = onion ? "tor" : primaryPeer.transport || "tcp";
-    }
+    const transportOf = (peer, uri, fallbackUri) => {
+      if (!peer) return null;
+      if (peer.transport === "iroh") {
+        const path = peer.iroh?.path;
+        return path === "direct" || path === "relay" ? `iroh-${path}` : "iroh-unknown";
+      }
+      const onion = peer.host?.endsWith(".onion") || (uri?.includes("@iroh:") && fallbackUri);
+      return onion ? "tor" : peer.transport || "tcp";
+    };
+    const primaryPeer = connectedPeer(primaryPubkey);
+    const primaryTransport = transportOf(primaryPeer, rec.lfbw?.primaryUri, rec.lfbw?.primaryFallbackUri);
+    const ranked = Array.isArray(rec.lfbw?.primaries);
+    const keys = primaryKeys(rec.lfbw);
+    const rankOf = new Map(keys.map((key, index) => [key, index + 1]));
     const wallet = publicWallet(rec);
     return {
       checkedAt: this._now(),
       primaryTransport,
       primaryRttMs: primaryPeer?.iroh?.rttMs ?? null,
+      ...(ranked
+        ? {
+            primaries: (wallet.lfbw?.primaries ?? []).map((entry, index) => {
+              const peer = connectedPeer(entry.pubkey);
+              return {
+                pubkey: entry.pubkey,
+                rank: index + 1,
+                connected: !!peer,
+                transport: transportOf(peer, entry.uri, entry.fallbackUri),
+                rttMs: peer?.iroh?.rttMs ?? null,
+              };
+            }),
+          }
+        : {}),
       wallet: wallet.lfbw ?? null,
       blockHeight: Number.isFinite(info?.blockHeight) ? info.blockHeight : null,
       electrumConnected:
@@ -1526,7 +1740,8 @@ export class WalletClient {
       channels: Array.isArray(channels)
         ? channels.map((c) => ({
             channelId: text(c.channelId),
-            withPrimary: c.peerPubkey === primaryPubkey,
+            withPrimary: ranked ? keys.includes(c.peerPubkey) : c.peerPubkey === primaryPubkey,
+            ...(ranked ? { peerRank: rankOf.get(c.peerPubkey) ?? null } : {}),
             state: text(c.state),
             htlcUsable: c.htlcUsable ?? null,
             fundingConfirmed: c.fundingConfirmed ?? null,
@@ -1556,6 +1771,48 @@ export class WalletClient {
           }
         : null,
     };
+  }
+  /**
+   * The host's capability flags, read at most once a minute: every snapshot
+   * asks whether the engine ranks primaries and sends out of several
+   * channels, and the answer does not change while the engine runs.
+   */
+  async _hostConfig() {
+    const now = this._now();
+    if (this._configCache && now - this._configCache.at < 60000) return this._configCache.value;
+    let value;
+    try {
+      value = await this.getConfig();
+    } catch {
+      return {};
+    }
+    this._configCache = { at: now, value: value || {} };
+    return this._configCache.value;
+  }
+  /**
+   * The ranked primaries policy, or null when the engine keeps one primary
+   * (`primariesAvailable` absent), so every caller keeps the one-primary
+   * path exactly as before. A stopped engine answers from the record's
+   * mirror alone.
+   */
+  async _primariesPolicy(rec, peers, offline, { force = false } = {}) {
+    // The record lists `primaries` only when its engine keeps the ranked
+    // list; a record from an engine with one primary has the scalar fields
+    // alone, and no read is spent on asking.
+    if (!force && !Array.isArray(rec?.lfbw?.primaries)) return null;
+    let policy;
+    try {
+      policy = await this._get("/primaries");
+    } catch (error) {
+      if (error?.code === "WALLET_STOPPED") return stoppedPolicy(rec);
+      if (error?.code === "NOT_FOUND" || error?.status === 404) return null;
+      throw error;
+    }
+    return mergedPolicy(policy, rec, peers, offline);
+  }
+  /** Whether receives that name no peer are steered by the engine: a policy with at least one primary. */
+  _steering(policy) {
+    return !!policy && policy.primaries.length > 0;
   }
   async _record() {
     requires(this.connection.walletId, "Choose a wallet first.", "NO_WALLET");
@@ -1652,6 +1909,12 @@ export class WalletClient {
       utxos,
       peers,
     });
+    const policy = await this._primariesPolicy(rec, peers, offline);
+    const config = await this._hostConfig();
+    const channelSends = config?.channelSendAvailable === true
+      ? await this._get("/channel-send/list").catch(() => [])
+      : [];
+    this._assertEpoch(epoch);
     // Canonical Lightning already includes disconnected/restore-held NORMAL balances;
     // splicingSats is a separate daemon bucket. Only add genuinely funded openings.
     // A dropped funding will not confirm, so its channel is not opening on it.
@@ -1773,7 +2036,11 @@ export class WalletClient {
         "Some funds are held while the wallet verifies its latest state. Still in your total.",
       );
     if (status.previousChannels.length > 0)
-      notes.push("Funds with your previous primary remain in your total.");
+      notes.push(
+        Array.isArray(rec.lfbw.retainedPeers)
+          ? "Funds at a node that is no longer one of your primaries remain in your total."
+          : "Funds with your previous primary remain in your total.",
+      );
     for (const saved of [...ledger.values()].filter(row => row.drain && row.status === "uncertain")) {
       try {
         const progress = drainRecord(await this._request(`/wallets/${encodeURIComponent(walletId)}/api/drain?requestId=${encodeURIComponent(saved.drain.requestId)}`));
@@ -1829,6 +2096,17 @@ export class WalletClient {
       ).filter((row) => !row.txid || !journalTxids.has(row.txid)),
       ...journal,
     ];
+    // A composite channel send is one sent payment; the transaction it made
+    // also funds the participating channels, which the merge above would
+    // otherwise read as an internal transfer.
+    const composites = channelSendRows(channelSends, this._now());
+    if (composites.length > 0) {
+      const compositeTxids = new Set(composites.map((row) => row.txid).filter(Boolean));
+      activity = [
+        ...activity.filter((row) => !row.txid || !compositeTxids.has(row.txid) || journal.some((entry) => entry.id === row.id)),
+        ...composites,
+      ];
+    }
     // What the wallet already knew joins the read before the saved requests
     // are reconciled, so a remembered receipt marks its request paid and a
     // remembered coin is folded into its request like a freshly read one.
@@ -1924,6 +2202,13 @@ export class WalletClient {
           ? { setupError: wallet.lfbw.setupError }
           : {}),
       },
+      ...(policy
+        ? {
+            primaries: policy.primaries,
+            primariesThresholdSat: policy.thresholdSat,
+            primariesReceiveTarget: policy.receiveTarget,
+          }
+        : {}),
       notes,
       updatedAt: this._now(),
       demo: false,
@@ -2134,6 +2419,7 @@ export class WalletClient {
     let paymentHash;
     let maxDetails;
     let rated;
+    let channelSend;
     let expiresAt = this._now() + 60000;
     if (target.kind === "bolt11") {
       const decoded = await this._post(
@@ -2183,16 +2469,13 @@ export class WalletClient {
       ]);
       const sendable = integerField(liquidity.maxSendableSats ?? liquidity.sendableSats, "available balance");
       const refuseShortfall = async (needed) => {
-        const primary = rec.lfbw?.primaryPubkey;
+        const keys = primaryKeys(rec.lfbw);
         requires(
-          !primary ||
-            (Array.isArray(peers) &&
-              peers.some(
-                (p) =>
-                  p.pubkey === primary &&
-                  (p.connected || p.state === "connected" || p.state === "ready"),
-              )),
-          "Your primary node needs to reconnect before this wallet can send over Lightning. It retries by itself, so try again in a minute.",
+          keys.length === 0 ||
+            (Array.isArray(peers) && peers.some((p) => keys.includes(p.pubkey) && peerConnected(p))),
+          keys.length > 1
+            ? "None of your primary nodes is connected, so this wallet cannot send over Lightning right now. It retries by itself, so try again in a minute."
+            : "Your primary node needs to reconnect before this wallet can send over Lightning. It retries by itself, so try again in a minute.",
           "PRIMARY_DOWN",
         );
         const arriving = await this._arrivingFunds(needed, rec);
@@ -2319,7 +2602,13 @@ export class WalletClient {
         warnings.push(
           "This request accepts direct funding, which needs a confirmed coin outside your channel. Paying the address instead.",
         );
-      const home = homeChannel(channels, rec.lfbw.primaryPubkey);
+      // The channel a payment leaves from: the usable one with the primary, or
+      // with ranked primaries the usable one holding the most, else one at a
+      // peer that is no longer ranked.
+      const keys = primaryKeys(rec.lfbw);
+      const home =
+        homeChannel(channels, keys) ??
+        (Array.isArray(rec.lfbw.primaries) ? homeChannel(channels, retainedKeys(rec.lfbw)) : null);
       requires(
         home,
         "Your wallet is still getting ready to send to a Bitcoin address. Wait for its funds to become available.",
@@ -2356,29 +2645,49 @@ export class WalletClient {
         amount = positiveSats(quote.maxAmountSats);
         maxDetails = { max: true, ...keptBalance([home], amount + feeSats) };
       }
+      let plan = null;
       if (!(amount <= integerField(quote.maxAmountSats, "send limit"))) {
-        const arriving = await this._arrivingFunds(
-          amount,
-          rec,
-          quote.maxAmountSats,
-        );
-        requires(
-          false,
-          arriving ||
-            "The available balance is too low for this payment and its fee.",
-          "INSUFFICIENT_FUNDS",
-        );
+        // No single channel covers it. An engine that pays an address out of
+        // several channels in one transaction is asked for that plan
+        // (coreyphillips/beignet#1922); otherwise the refusal stands as before.
+        plan = max ? null : await this._channelSendPlan({ destination, amount, feeratePerkw, channels });
+        if (!plan) {
+          const arriving = await this._arrivingFunds(
+            amount,
+            rec,
+            quote.maxAmountSats,
+          );
+          requires(
+            false,
+            arriving ||
+              "The available balance is too low for this payment and its fee.",
+            "INSUFFICIENT_FUNDS",
+          );
+        }
       }
-      path = "/channel/splice-out";
-      body = {
-        channelId: home.channelId,
-        amountSats: amount,
-        feeratePerkw,
-        address: destination,
-      };
-      warnings.push(home.fundingConfirmed === false
-        ? "The channel funding is unconfirmed. Both it and this payment must confirm before the payment completes."
-        : "Completes after one confirmation.");
+      if (plan && plan.kind === "composite") {
+        feeSats = plan.feeSats;
+        expiresAt = Math.min(expiresAt, plan.expiresAt);
+        path = plan.path;
+        body = plan.body;
+        channelSend = { kind: "composite", channels: plan.channels };
+        warnings.push(
+          `Paid out of ${plan.channels} channels in one transaction. Completes after one confirmation.`,
+        );
+      } else {
+        const from = plan ? plan.channel : home;
+        if (plan) feeSats = plan.feeSats;
+        path = "/channel/splice-out";
+        body = {
+          channelId: from.channelId,
+          amountSats: amount,
+          feeratePerkw,
+          address: destination,
+        };
+        warnings.push(from.fundingConfirmed === false
+          ? "The channel funding is unconfirmed. Both it and this payment must confirm before the payment completes."
+          : "Completes after one confirmation.");
+      }
     }
     this._assertEpoch(epoch);
     const review = {
@@ -2393,6 +2702,7 @@ export class WalletClient {
       totalSats: maxDetails?.debitSats ?? amount + feeSats,
       ...maxDetails,
       ...rated,
+      ...(channelSend ? { channelSend } : {}),
       route,
       expiresAt,
       warnings,
@@ -2408,6 +2718,59 @@ export class WalletClient {
       ...(rated && chosen != null ? { feeRate: chosen } : {}),
     });
     return review;
+  }
+  /**
+   * The engine's plan for an address no single channel covers: a payment out
+   * of several channels in one transaction, or the one channel it would use
+   * (coreyphillips/beignet#1922). Null when the engine has no such plan or
+   * refuses one, so the caller's refusal stands as before.
+   */
+  async _channelSendPlan({ destination, amount, feeratePerkw, channels }) {
+    const config = await this._hostConfig();
+    if (config?.channelSendAvailable !== true) return null;
+    let quote;
+    try {
+      quote = await this._post(
+        "/channel-send/quote",
+        { address: destination, amountSats: amount, feeratePerkw },
+        true,
+      );
+    } catch (error) {
+      if (
+        ["SPLICE_REFUSED", "SPLICE_BUSY", "NOT_PERSISTED", "INVALID_PARAMS", "NOT_FOUND"].includes(error?.code) ||
+        error?.status === 404
+      )
+        return null;
+      throw error;
+    }
+    requires(
+      (quote?.kind === "single" || quote?.kind === "composite") &&
+        Array.isArray(quote.channels) && quote.channels.length > 0 &&
+        typeof quote.quoteId === "string" && quote.quoteId,
+      "The wallet returned an invalid channel send quote.",
+      "INVALID_RESPONSE",
+    );
+    requires(
+      integerField(quote.amountSats, "send amount") === amount,
+      "The wallet quoted another amount. Review the payment again.",
+      "INVALID_RESPONSE",
+    );
+    const feeSats = integerField(quote.feeSats, "transaction fee");
+    const expiresAt = Number.isFinite(quote.expiresAt) ? quote.expiresAt : Infinity;
+    if (quote.kind === "single") {
+      const channelId = text(quote.channels[0]?.channelId);
+      const channel = channels.find((c) => c.channelId === channelId);
+      requires(channel, "The wallet quoted a channel it does not list.", "INVALID_RESPONSE");
+      return { kind: "single", feeSats, expiresAt, channel };
+    }
+    return {
+      kind: "composite",
+      feeSats,
+      expiresAt,
+      channels: quote.channels.length,
+      path: "/channel-send/execute",
+      body: { quoteId: quote.quoteId },
+    };
   }
   async send(review) {
     const epoch = this._epoch;
@@ -2492,7 +2855,9 @@ export class WalletClient {
           : held.body,
       );
       const status =
-        held.path === "/channel/splice-out"
+        held.path === "/channel-send/execute"
+          ? channelSendStatus(response?.stage)
+          : held.path === "/channel/splice-out"
           ? response?.ok === false
             ? "failed"
             : response?.status
@@ -2504,6 +2869,10 @@ export class WalletClient {
           : response?.status
           ? activityStatus(response.status)
           : "uncertain";
+      const composite =
+        held.path === "/channel-send/execute" && held.review.channelSend
+          ? { ...held.review.channelSend, id: text(response?.id) || held.body.quoteId }
+          : null;
       const payAll = payAllRecord(response?.payAll);
       if (held.path === "/invoice/pay-all")
         requires(payAll && payAll.debitMsat === held.body.debitMsat &&
@@ -2519,8 +2888,9 @@ export class WalletClient {
             : integerField(response.feeSats, "payment fee"),
         feeKnown: true,
         feeEstimated:
-          payAll ? status !== "completed" : held.path === "/channel/splice-out" || response?.feeSats == null,
+          payAll ? status !== "completed" : held.path === "/channel/splice-out" || held.path === "/channel-send/execute" || response?.feeSats == null,
         ...(payAll ? { payAll } : {}),
+        ...(composite ? { channelSend: composite } : {}),
         ...(response?.paymentHash || held.paymentHash
           ? { paymentHash: response?.paymentHash || held.paymentHash }
           : {}),
@@ -2533,7 +2903,7 @@ export class WalletClient {
             : status === "pending"
             ? "Payment submitted. Follow its progress in Activity."
             : status === "failed"
-            ? text(response?.failureDescription) ||
+            ? text(response?.failureDescription) || text(response?.reason) ||
               "The wallet declined this payment."
             : "The payment result is unknown. Check Activity before sending again.",
       };
@@ -2629,7 +2999,8 @@ export class WalletClient {
   async _recordSubmission(review, held, result) {
     if (result.status === "failed" && held.paymentHash)
       this._paymentLocks.delete(`${held.walletId}:${held.paymentHash}`);
-    const reference = review.method === "drain" ? review.id : result.paymentHash || result.txid || review.id;
+    const reference = review.method === "drain" ? review.id
+      : result.channelSend?.id || result.paymentHash || result.txid || review.id;
     const row = {
       walletId: held.walletId,
       id: review.method === "drain" ? `drain:${review.id}` : `submission:${review.id}`,
@@ -2650,6 +3021,7 @@ export class WalletClient {
       feeEstimated: result.feeEstimated,
       ...(result.payAll ? { payAll: result.payAll } : {}),
       ...(result.drain ? { drain: result.drain } : {}),
+      ...(result.channelSend ? { channelSend: { kind: result.channelSend.kind, id: result.channelSend.id } } : {}),
       status: result.status,
       timestamp: this._now(),
       reference,
@@ -2663,8 +3035,9 @@ export class WalletClient {
       await this._commitLedger(held.walletId, [saved]);
     }
   }
-  async quoteReceive({ amountSats, description, mode, requestId } = {}) {
+  async quoteReceive({ amountSats, description, mode, requestId, peer } = {}) {
     validateReceiveMode(mode);
+    const namedPeer = peer === undefined || peer === null ? undefined : validatePubkey(peer);
     requires(requestId === undefined || (mode === "offline" && typeof requestId === "string" && /^[a-zA-Z0-9_-]{16,160}$/.test(requestId)),
       "A valid offline request ID is required.", "INVALID_PARAMS");
     const quoteId = requestId ?? uid();
@@ -2680,20 +3053,26 @@ export class WalletClient {
       this._get("/channels"),
       this._get("/peers"),
     ]);
-    const connected = peers.some(
-      (p) =>
-        p.pubkey === rec.lfbw.primaryPubkey &&
-        (p.connected || p.state === "connected" || p.state === "ready"),
-    );
+    // With ranked primaries and no peer named, the engine steers the receive
+    // (coreyphillips/beignet#1922): the query names no peer and the answer
+    // says which primary took it. A named peer, or an engine with one
+    // primary, is asked exactly as before.
+    const keys = primaryKeys(rec.lfbw);
+    const steering = Array.isArray(rec.lfbw.primaries) && keys.length > 0 && namedPeer === undefined;
+    const target = namedPeer ?? (steering ? undefined : rec.lfbw.primaryPubkey);
+    const connected = steering
+      ? peers.some((p) => keys.includes(p.pubkey) && peerConnected(p))
+      : peers.some((p) => p.pubkey === target && peerConnected(p));
     let plan = planInvoice({
       wantedSats: amount || 0,
       channels,
-      primaryPubkey: rec.lfbw.primaryPubkey,
-      previousPrimary: rec.lfbw.previousPrimary || null,
+      primaryPubkey: steering ? keys : target,
+      previousPrimary: retainedKeys(rec.lfbw),
       setup: rec.lfbw.setup,
       primaryConnected: connected,
     });
     let offlineQuote;
+    let steered;
     // Receiving offline is an opt-in, never the default, on every surface
     // (umbrel 0.23.1 made the same change). The default plan is a plain
     // invoice over existing inbound capacity, or a JIT invoice when the
@@ -2711,8 +3090,11 @@ export class WalletClient {
         "RECEIVE_UNAVAILABLE",
       );
       requires(amount != null, "Enter an amount for this payment request.", "AMOUNT_REQUIRED");
-      offlineQuote = await this._get(`/receive/quote?peer=${encodeURIComponent(rec.lfbw.primaryPubkey)}&amountSats=${amount}&requestId=${encodeURIComponent(quoteId)}`);
+      offlineQuote = await this._get(
+        `/receive/quote?${target ? `peer=${encodeURIComponent(target)}&` : ""}amountSats=${amount}&requestId=${encodeURIComponent(quoteId)}`,
+      );
       requires(offlineQuote?.available === true, "Your node cannot prepare this payment request right now. Try again shortly.", "RECEIVE_UNAVAILABLE");
+      if (PUBKEY_RE.test(text(offlineQuote.peer))) steered = { peer: text(offlineQuote.peer).toLowerCase(), skipped: offlineQuote.skipped };
       // A host's daemon answers an amount no channel can hold offline with a
       // direct-funding plan (beignet #925), which would fail verification
       // after the review. Refuse it here instead.
@@ -2739,15 +3121,15 @@ export class WalletClient {
         "Enter an amount so your primary node can quote the receive fee.",
         "AMOUNT_REQUIRED",
       );
-      const query = `?lspPubkey=${encodeURIComponent(
-        rec.lfbw.primaryPubkey,
-      )}&amountSats=${amount}&targetRemainingInboundSat=${INBOUND_HEADROOM_SATS}`;
+      const query = `?${target ? `lspPubkey=${encodeURIComponent(target)}&` : ""}amountSats=${amount}&targetRemainingInboundSat=${INBOUND_HEADROOM_SATS}`;
       let quote;
       try {
         quote = await this._get("/jit/quote" + query);
       } catch (error) {
         throw jitReceiveError(error, "quote");
       }
+      if (PUBKEY_RE.test(text(quote?.lspPubkey))) steered = { peer: text(quote.lspPubkey).toLowerCase(), skipped: quote.skipped };
+      else if (target) steered = { peer: target };
       requires(
         quote.accepted === true && quote.withinCeilings === true,
         quote.reason ||
@@ -2775,6 +3157,21 @@ export class WalletClient {
         );
     }
     this._assertEpoch(epoch);
+    // The primaries passed over on the way to the one that took it, as the
+    // engine lists them, each said once so the app can show why.
+    const skipped = Array.isArray(steered?.skipped)
+      ? steered.skipped
+          .filter((skip) => skip && PUBKEY_RE.test(text(skip.pubkey)) && Number.isSafeInteger(skip.rank))
+          .map((skip) => ({
+            pubkey: text(skip.pubkey).toLowerCase(),
+            rank: skip.rank,
+            stage: ["connect", "attempt", "budget"].includes(skip.stage) ? skip.stage : "attempt",
+            code: text(skip.code).slice(0, 64),
+            message: text(skip.message).slice(0, 512),
+          }))
+      : [];
+    for (const skip of skipped)
+      warnings.push(`Primary ${skip.rank} was passed over: ${skip.message || skip.code || "it did not answer"}`.slice(0, 512));
     const quote = {
       id: quoteId,
       amountSats: amount,
@@ -2784,12 +3181,15 @@ export class WalletClient {
       expiresAt: this._now() + 60000,
       warnings,
       ...(mode === "offline" ? { mode: "offline", ...(offlineQuote.concurrentVersion ? { concurrentVersion: offlineQuote.concurrentVersion } : {}) } : {}),
+      ...(steered?.peer && plan.kind !== "plain" ? { peer: steered.peer } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
     };
     this._receiveQuotes.set(quote.id, {
       quote: clone(quote),
       walletId: this.connection.walletId,
       plan: plan.kind,
       rec,
+      peer: steered?.peer,
       feePolicy,
       offlineQuote,
       ...(previous?.walletId === this.connection.walletId && previous.plan === "offline" ? { preparedRequest: previous.preparedRequest } : {}),
@@ -2823,7 +3223,7 @@ export class WalletClient {
         requires(request.expiresAt > this._now(), "The created request has expired. Create a new receive request.", "INVOICE_EXPIRED");
         const invoice = await this._post("/receive/invoice", {
           amountSats: quote.amountSats, description: quote.description, expirySecs: 600,
-          peer: held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote,
+          peer: held.peer ?? held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote,
         });
         this._assertEpoch(epoch);
         requires(invoice?.offlineReceive === true && invoice.bolt11 === request.bolt11 && invoice.paymentHash === request.paymentHash,
@@ -2877,11 +3277,13 @@ export class WalletClient {
       invoice = await this._post(
         held.plan === "offline" ? "/receive/invoice" : held.plan === "jit" ? "/jit/invoice" : "/invoice/create",
         held.plan === "offline"
-          ? { ...body, peer: held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote }
+          ? { ...body, peer: held.peer ?? held.rec.lfbw.primaryPubkey, requestId: quote.id, quote: held.offlineQuote }
           : held.plan === "jit"
           ? {
               ...body,
-              lspPubkey: held.rec.lfbw.primaryPubkey,
+              // The primary the quote was priced at, so quote and create
+              // agree on the peer and its fee (steered or named).
+              lspPubkey: held.peer ?? held.rec.lfbw.primaryPubkey,
               targetRemainingInboundSat: INBOUND_HEADROOM_SATS,
               // Beignet 0.15.0 collects an opening fee two ways. `skim` takes it
               // out of the delivery, which is what quoteReceive priced and what
@@ -3009,7 +3411,7 @@ export class WalletClient {
       this._assertEpoch(epoch);
       const result = publicStoredRequest(saved?.request);
       this._receiveQuotes.delete(quote.id);
-      return result;
+      return held.peer && held.plan !== "plain" ? { ...result, peer: held.peer } : result;
     } catch (error) {
       if (error?.code === "WALLET_CHANGED") throw error;
       throw new WalletError(
@@ -3709,6 +4111,83 @@ export class WalletClient {
   async retrySetup() {
     await this._request(this._managerWalletPath("/lfbw/setup"), "POST", {});
   }
+  async _requirePrimariesAvailable() {
+    const config = await this._hostConfig();
+    requires(
+      config?.primariesAvailable === true,
+      "This wallet keeps one primary node. Update the wallet engine to rank several.",
+      "PRIMARIES_UNAVAILABLE",
+    );
+  }
+  /**
+   * The ranked primaries policy (coreyphillips/beignet#1924): the engine's
+   * list with each primary's figures and receive order, merged with what the
+   * record and the peer list know of it. A stopped engine answers from the
+   * record's mirror alone, nothing connected.
+   */
+  async listPrimaries() {
+    const epoch = this._epoch;
+    await this._requirePrimariesAvailable();
+    const rec = await this._record();
+    const [peers, offline] = await Promise.all([
+      this._get("/peers").catch(() => null),
+      this._get("/receive/offline").catch(() => null),
+    ]);
+    const policy = await this._primariesPolicy(rec, peers, offline, { force: true });
+    this._assertEpoch(epoch);
+    requires(policy, "The wallet did not return its primaries.", "PRIMARIES_UNAVAILABLE");
+    return policy;
+  }
+  async _writePrimaries(path, body) {
+    const epoch = this._epoch;
+    await this._requirePrimariesAvailable();
+    await this._record();
+    this._assertEpoch(epoch);
+    await this._post(path, body);
+    this._assertEpoch(epoch);
+    // A quote or review priced against the old list no longer holds.
+    this._sendReviews.clear();
+    this._receiveQuotes.clear();
+    return this.listPrimaries();
+  }
+  /** Rank a primary: by its URI, with an optional same-key onion fallback for an Iroh one, at `rank` (default last). */
+  async addPrimary({ uri, fallbackUri, rank } = {}) {
+    const primaryUri = validatePrimaryUri(uri);
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
+    requires(
+      rank === undefined || rank === null || (Number.isSafeInteger(rank) && rank >= 1),
+      "Choose a rank of 1 or more.",
+      "INVALID_PARAMS",
+    );
+    const parsed = parsePrimaryUri(primaryUri);
+    return this._writePrimaries("/primaries/add", {
+      pubkey: parsed.pubkey,
+      ...(parsed.transport ? { uri: parsed.uri } : { host: parsed.host, port: parsed.port }),
+      ...(primaryFallbackUri ? { fallbackUri: primaryFallbackUri } : {}),
+      trusted: true,
+      ...(rank ? { rank } : {}),
+    });
+  }
+  /** Drop a primary from the ranking. Its channels and funds stay. */
+  async removePrimary(pubkey) {
+    return this._writePrimaries("/primaries/remove", { pubkey: validatePubkey(pubkey) });
+  }
+  /** Re-rank: every primary once, highest rank first. */
+  async reorderPrimaries(pubkeys) {
+    requires(Array.isArray(pubkeys) && pubkeys.length > 0, "Name every primary node once, highest rank first.", "INVALID_PARAMS");
+    const order = pubkeys.map(validatePubkey);
+    requires(new Set(order).size === order.length, "Name every primary node once, highest rank first.", "INVALID_PARAMS");
+    return this._writePrimaries("/primaries/reorder", { order });
+  }
+  /** The soft fill target in whole sats, or null for none (the first-ranked primary always takes the receive). */
+  async setPrimariesThreshold(sats) {
+    requires(
+      sats === null || (Number.isSafeInteger(sats) && sats >= 0),
+      "Enter a whole number of sats for the fill target, or clear it.",
+      "INVALID_THRESHOLD",
+    );
+    return this._writePrimaries("/primaries/threshold", { fillThresholdSat: sats });
+  }
 }
 
 // Preview runs wholly in memory and never touches a transport or real wallet.
@@ -3730,6 +4209,17 @@ export class DemoWalletClient {
         setup: "ready",
         primaryUri: DEFAULT_PRIMARY_URI,
         primaryPubkey: DEFAULT_PRIMARY_URI.split("@")[0],
+        primaries: [
+          {
+            pubkey: DEFAULT_PRIMARY_URI.split("@")[0],
+            uri: DEFAULT_PRIMARY_URI,
+            trusted: true,
+            setup: "ready",
+            connected: true,
+          },
+        ],
+        primariesThresholdSat: null,
+        retainedPeers: [],
       },
     };
     this._balance = 284650;
@@ -3796,7 +4286,98 @@ export class DemoWalletClient {
       drainAvailable: true,
       jitQuoteAvailable: true,
       recoveryAvailable: true,
+      primariesAvailable: true,
+      channelSendAvailable: true,
     };
+  }
+  /**
+   * The preview's ranked primaries as a policy: the first entry holds the
+   * preview balance and is the receive target under the engine's rule (the
+   * first below the fill threshold in rank order, else the lowest balance).
+   */
+  _policy() {
+    const entries = this.wallet.lfbw.primaries;
+    const threshold = this.wallet.lfbw.primariesThresholdSat;
+    const balanceOf = (index) => (index === 0 ? this._balance : 0);
+    const order = entries
+      .map((entry, index) => ({ index, balanceSat: balanceOf(index), below: threshold === null || balanceOf(index) < threshold }))
+      .sort((a, b) => (a.below !== b.below ? (a.below ? -1 : 1) : a.below ? a.index - b.index : a.balanceSat - b.balanceSat || a.index - b.index));
+    const position = new Map(order.map((o, at) => [o.index, at]));
+    const primaries = entries.map((entry, index) => ({
+      pubkey: entry.pubkey,
+      rank: index + 1,
+      uri: entry.uri,
+      fallbackUri: entry.fallbackUri ?? null,
+      connected: true,
+      setup: "ready",
+      trusted: true,
+      balanceSat: balanceOf(index),
+      channelCount: index === 0 ? 1 : 0,
+      belowThreshold: order[position.get(index)].below,
+      isReceiveTarget: position.get(index) === 0,
+      selectionOrder: position.get(index) + 1,
+      offlineReceiveAvailable: index === 0,
+    }));
+    return {
+      thresholdSat: threshold,
+      receiveTarget: primaries.find((p) => p.isReceiveTarget)?.pubkey ?? null,
+      primaries,
+    };
+  }
+  _syncPrimaryMirror() {
+    const first = this.wallet.lfbw.primaries[0];
+    this.wallet.lfbw.primaryUri = first ? first.uri : null;
+    this.wallet.lfbw.primaryFallbackUri = first ? first.fallbackUri : undefined;
+    this.wallet.lfbw.primaryPubkey = first ? first.pubkey : null;
+  }
+  async listPrimaries() {
+    return this._policy();
+  }
+  async addPrimary({ uri, fallbackUri, rank } = {}) {
+    const primaryUri = validatePrimaryUri(uri);
+    const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
+    requires(rank === undefined || rank === null || (Number.isSafeInteger(rank) && rank >= 1), "Choose a rank of 1 or more.", "INVALID_PARAMS");
+    const entries = this.wallet.lfbw.primaries;
+    const pubkey = parsePrimaryUri(primaryUri).pubkey;
+    requires(!entries.some((entry) => entry.pubkey === pubkey), "That node is already one of your primaries.", "INVALID_PARAMS");
+    requires(entries.length < 32, "At most 32 primary nodes can be ranked.", "INVALID_PARAMS");
+    const entry = { pubkey, uri: primaryUri, fallbackUri: primaryFallbackUri ?? undefined, trusted: true, setup: "ready", connected: true };
+    const at = Math.min(rank ? rank - 1 : entries.length, entries.length);
+    entries.splice(at, 0, entry);
+    this._syncPrimaryMirror();
+    this._sendReviews.clear();
+    this._receiveQuotes.clear();
+    return this._policy();
+  }
+  async removePrimary(pubkey) {
+    const key = validatePubkey(pubkey);
+    const entries = this.wallet.lfbw.primaries;
+    requires(entries.some((entry) => entry.pubkey === key), "That node is not one of your primaries.", "INVALID_PARAMS");
+    this.wallet.lfbw.primaries = entries.filter((entry) => entry.pubkey !== key);
+    this._syncPrimaryMirror();
+    this._sendReviews.clear();
+    this._receiveQuotes.clear();
+    return this._policy();
+  }
+  async reorderPrimaries(pubkeys) {
+    requires(Array.isArray(pubkeys) && pubkeys.length > 0, "Name every primary node once, highest rank first.", "INVALID_PARAMS");
+    const order = pubkeys.map(validatePubkey);
+    const entries = this.wallet.lfbw.primaries;
+    requires(
+      new Set(order).size === order.length && order.length === entries.length && order.every((key) => entries.some((entry) => entry.pubkey === key)),
+      "Name every primary node once, highest rank first.",
+      "INVALID_PARAMS",
+    );
+    this.wallet.lfbw.primaries = order.map((key) => entries.find((entry) => entry.pubkey === key));
+    this._syncPrimaryMirror();
+    this._sendReviews.clear();
+    this._receiveQuotes.clear();
+    return this._policy();
+  }
+  async setPrimariesThreshold(sats) {
+    requires(sats === null || (Number.isSafeInteger(sats) && sats >= 0), "Enter a whole number of sats for the fill target, or clear it.", "INVALID_THRESHOLD");
+    this.wallet.lfbw.primariesThresholdSat = sats;
+    return this._policy();
   }
   async getRecoveryPhrase() {
     throw new WalletError(
@@ -3827,11 +4408,22 @@ export class DemoWalletClient {
       lfbw: {
         ...this.wallet.lfbw,
         primaryUri: validatePrimaryUri(primaryUri || DEFAULT_PRIMARY_URI),
+        primaryPubkey: parsePrimaryUri(primaryUri || DEFAULT_PRIMARY_URI).pubkey,
+        primaries: [
+          {
+            pubkey: parsePrimaryUri(primaryUri || DEFAULT_PRIMARY_URI).pubkey,
+            uri: validatePrimaryUri(primaryUri || DEFAULT_PRIMARY_URI),
+            trusted: true,
+            setup: "ready",
+            connected: true,
+          },
+        ],
       },
     };
     return clone(this.wallet);
   }
   async snapshot() {
+    const policy = this._policy();
     return {
       wallet: clone(this.wallet),
       balance: {
@@ -3851,9 +4443,13 @@ export class DemoWalletClient {
       activity: clone(this._activity),
       primary: {
         uri: this.wallet.lfbw.primaryUri,
+        ...(this.wallet.lfbw.primaryFallbackUri ? { fallbackUri: this.wallet.lfbw.primaryFallbackUri } : {}),
         connected: true,
         setup: "ready",
       },
+      primaries: policy.primaries,
+      primariesThresholdSat: policy.thresholdSat,
+      primariesReceiveTarget: policy.receiveTarget,
       notes: this._looseBalance ? [
         `${formatSats(this._looseBalance)} sats are arriving. They will become available after confirmation.`,
       ] : [],
@@ -4141,8 +4737,12 @@ export class DemoWalletClient {
   async updatePrimary(uri, fallbackUri) {
     const primaryUri = validatePrimaryUri(uri);
     const primaryFallbackUri = validatePrimaryFallback(primaryUri, fallbackUri);
+    const entry = { pubkey: parsePrimaryUri(primaryUri).pubkey, uri: primaryUri, fallbackUri: primaryFallbackUri ?? undefined, trusted: true, setup: "ready", connected: true };
+    // Replaces rank 1 and keeps the rest of the list, as the runtime does.
+    this.wallet.lfbw.primaries = [entry, ...this.wallet.lfbw.primaries.slice(1).filter((p) => p.pubkey !== entry.pubkey)];
     this.wallet.lfbw.primaryUri = primaryUri;
     this.wallet.lfbw.primaryFallbackUri = primaryFallbackUri;
+    this.wallet.lfbw.primaryPubkey = entry.pubkey;
     return clone(this.wallet);
   }
   async startWallet() {}

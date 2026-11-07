@@ -5880,3 +5880,370 @@ test('drain deduplicates an overlapping snapshot against the final durable ledge
   assert.equal(snapshot.activity.length, 1);
   assert.deepEqual(snapshot.activity[0].drain.txids, txids);
 });
+
+// ── Ranked primaries (coreyphillips/beignet#1924) ────────────────────────
+const PK2 = "03" + "77".repeat(32);
+const URI2 = `${PK2}@second.example:9736`;
+const channel2 = {
+  channelId: "channel-2",
+  peerPubkey: PK2,
+  htlcUsable: true,
+  state: "NORMAL",
+  localBalanceSats: 300000,
+  remoteBalanceSats: 50000,
+};
+const ranked = {
+  ...record,
+  lfbw: {
+    ...record.lfbw,
+    primaries: [
+      { pubkey: PK, uri: DEFAULT_PRIMARY_URI, trusted: true, setup: "ready", connected: true },
+      { pubkey: PK2, uri: URI2, trusted: false, setup: "ready", connected: true },
+    ],
+    primariesThresholdSat: null,
+    receiveTarget: PK,
+    retainedPeers: [],
+  },
+};
+const enginePolicy = (receiveTarget = PK, fillThresholdSat = null) => ({
+  fillThresholdSat,
+  primaries: [
+    { pubkey: PK, rank: 1, host: "ulyeemszaigzrvpjcjcby4ehibrvsuqi5sq4dmmew2urk2nse5f7spid.onion", port: 9102, uri: null, thresholdSat: fillThresholdSat, balanceSat: 200000, channelCount: 1, belowThreshold: true, isReceiveTarget: receiveTarget === PK, selectionOrder: receiveTarget === PK ? 1 : 2 },
+    { pubkey: PK2, rank: 2, host: "second.example", port: 9736, uri: null, thresholdSat: fillThresholdSat, balanceSat: 300000, channelCount: 1, belowThreshold: true, isReceiveTarget: receiveTarget === PK2, selectionOrder: receiveTarget === PK2 ? 1 : 2 },
+  ],
+  receiveTarget,
+});
+const rankedOverrides = (extra = {}) => ({
+  "/api/wallets": [ranked],
+  "/api/wallets/wallet-1": ranked,
+  "/api/config": { defaultNetwork: "mainnet", defaultElectrum: null, supportedNetworks: ["mainnet", "regtest"], lfbwAvailable: true, primariesAvailable: true, channelSendAvailable: true },
+  "/primaries": enginePolicy(),
+  "POST /primaries/add": () => enginePolicy(),
+  "POST /primaries/remove": () => enginePolicy(),
+  "POST /primaries/reorder": () => enginePolicy(),
+  "POST /primaries/threshold": () => enginePolicy(),
+  "/channels": [channel, channel2],
+  "/peers": [{ pubkey: PK, state: "connected" }, { pubkey: PK2, state: "ready" }],
+  "/liquidity": { sendableSats: 490000 },
+  ...extra,
+});
+
+test("a one-primary engine is driven exactly as before: no primaries or channel-send route is ever asked and the peer is still named", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client, calls } = makeClient({
+      "/jit/quote": { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12 },
+      "/receive/quote": { available: true, peer: PK, amountSats: 10000, feeSats: 0, terms: { feeBaseMsat: 0, feePpm: 0 }, expiresAt: NOW + 60000 },
+      "/receive/invoice": { bolt11: INVOICE, paymentHash: HASH, offlineReceive: true, requestId: "req" },
+    });
+    const snapshot = await client.snapshot();
+    assert.equal("primaries" in snapshot, false);
+    assert.equal(snapshot.primary.uri, DEFAULT_PRIMARY_URI);
+    const [wallet] = await client.listWallets();
+    assert.deepEqual(JSON.parse(JSON.stringify(wallet)), {
+      id: "wallet-1", name: "My wallet", network: "mainnet", status: "running",
+      lfbw: { enabled: true, primaryUri: DEFAULT_PRIMARY_URI, primaryPubkey: PK, setup: "ready" },
+    });
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal("peer" in quote, false, "a plain invoice names no peer");
+    await client.receive(quote);
+    const review = await client.prepareSend({ request: ADDRESS, amountSats: 5000 });
+    assert.equal("channelSend" in review, false);
+    await client.send(review);
+    const { client: jitClient, calls: jitCalls } = makeClient({
+      "/channels": [],
+      "/jit/quote": { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12 },
+    });
+    const jit = await jitClient.quoteReceive({ amountSats: 10000 });
+    assert.equal(jit.peer, PK, "the one primary is the peer a JIT quote names");
+    await jitClient.receive(jit);
+    assert.equal(new URLSearchParams(jitCalls.find((c) => c.path === "/jit/quote").query).get("lspPubkey"), PK);
+    assert.equal(jitCalls.find((c) => c.path === "/jit/invoice").body.lspPubkey, PK);
+    for (const list of [calls, jitCalls])
+      assert.equal(list.some((c) => c.path.startsWith("/primaries") || c.path.startsWith("/channel-send")), false);
+    await assert.rejects(client.listPrimaries(), { code: "PRIMARIES_UNAVAILABLE" });
+    await assert.rejects(client.addPrimary({ uri: URI2 }), { code: "PRIMARIES_UNAVAILABLE" });
+    assert.equal(calls.some((c) => c.path.startsWith("/primaries")), false);
+  }
+});
+
+test("the ranked policy is the engine's list with the record's facts and the peers' connections, the same over both adapters", async () => {
+  const seen = [];
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client } = makeClient(rankedOverrides({
+      "/receive/offline": { maxSats: 90000, available: true, reason: null, peers: [{ pubkey: PK, maxSats: 90000, available: true, reason: null }, { pubkey: PK2, maxSats: 0, available: false, reason: "Settlement off" }] },
+      "/peers": [{ pubkey: PK2, state: "connected" }],
+    }));
+    const policy = await client.listPrimaries();
+    assert.deepEqual(policy.primaries.map((p) => [p.pubkey, p.rank, p.connected, p.setup, p.trusted, p.balanceSat, p.isReceiveTarget, p.selectionOrder, p.offlineReceiveAvailable]), [
+      [PK, 1, false, "ready", true, 200000, true, 1, true],
+      [PK2, 2, true, "ready", false, 300000, false, 2, false],
+    ]);
+    assert.equal(policy.primaries[1].uri, URI2);
+    assert.equal(policy.primaries[1].offlineReceiveReason, "Settlement off");
+    assert.equal(policy.thresholdSat, null);
+    assert.equal(policy.receiveTarget, PK);
+    const snapshot = await client.snapshot();
+    assert.equal(snapshot.primary.uri, DEFAULT_PRIMARY_URI, "primary stays rank 1");
+    assert.equal(snapshot.primary.connected, false);
+    assert.equal(snapshot.primariesReceiveTarget, PK);
+    assert.equal(snapshot.primariesThresholdSat, null);
+    assert.equal(snapshot.wallet.lfbw.primaries.length, 2);
+    assert.deepEqual(snapshot.wallet.lfbw.retainedPeers, []);
+    seen.push(JSON.stringify(snapshot.primaries));
+  }
+  assert.equal(seen[0], seen[1]);
+});
+
+test("a stopped engine lists the record's mirror with nothing connected, and a host whose record keeps no mirror still reads the engine's list", async () => {
+  const { client } = embeddedFixture(rankedOverrides({
+    "/peers": new Error("stopped"),
+    "/primaries": { response: result({ ok: false, error: { code: "WALLET_STOPPED", message: "Start your wallet first" } }, 409) },
+  }));
+  const policy = await client.listPrimaries();
+  assert.deepEqual(policy.primaries.map((p) => [p.pubkey, p.connected, p.balanceSat, p.isReceiveTarget]), [[PK, false, 0, true], [PK2, false, 0, false]]);
+  const { client: host } = fixture({
+    "/api/config": { defaultNetwork: "mainnet", defaultElectrum: null, supportedNetworks: ["mainnet"], lfbwAvailable: true, primariesAvailable: true },
+    "/primaries": enginePolicy(PK2),
+    "/peers": [{ pubkey: PK2, state: "connected" }],
+  });
+  const listed = await host.listPrimaries();
+  assert.deepEqual(listed.primaries.map((p) => [p.pubkey, p.connected, p.setup, p.isReceiveTarget]), [[PK, false, "pending", false], [PK2, true, "ready", true]]);
+  assert.equal(listed.primaries[1].uri, URI2.replace("second.example:9736", "second.example:9736"));
+  assert.equal("primaries" in (await host.snapshot()), false, "a record without the mirror reads as one primary");
+});
+
+test("policy writes carry the daemon's bodies, refuse malformed input before any request, and discard held quotes and reviews", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client, calls } = makeClient(rankedOverrides());
+    const irohKey = "02" + "cc".repeat(32);
+    const iroh = `${irohKey}@iroh:${"c".repeat(64)}`;
+    const onion = `${irohKey}@${"c".repeat(56)}.onion:9735`;
+    const review = await client.prepareSend({ request: ADDRESS, amountSats: 5000 });
+    await client.addPrimary({ uri: URI2.replace(PK2, "02" + "dd".repeat(32)), rank: 1 });
+    await client.addPrimary({ uri: iroh, fallbackUri: onion });
+    await client.removePrimary(PK2.toUpperCase());
+    await client.reorderPrimaries([PK2, PK]);
+    await client.setPrimariesThreshold(250000);
+    await client.setPrimariesThreshold(null);
+    assert.deepEqual(calls.filter((c) => c.path.startsWith("/primaries/")).map((c) => [c.path, c.body]), [
+      ["/primaries/add", { pubkey: "02" + "dd".repeat(32), host: "second.example", port: 9736, trusted: true, rank: 1 }],
+      ["/primaries/add", { pubkey: irohKey, uri: iroh, fallbackUri: onion, trusted: true }],
+      ["/primaries/remove", { pubkey: PK2 }],
+      ["/primaries/reorder", { order: [PK2, PK] }],
+      ["/primaries/threshold", { fillThresholdSat: 250000 }],
+      ["/primaries/threshold", { fillThresholdSat: null }],
+    ]);
+    await assert.rejects(client.send(review), { code: "INVALID_REVIEW" }, "a review priced against the old list is gone");
+    const before = calls.length;
+    for (const bad of [1.5, -1, 2 ** 53, "", "1000", undefined])
+      await assert.rejects(client.setPrimariesThreshold(bad), { code: "INVALID_THRESHOLD" });
+    await assert.rejects(client.addPrimary({ uri: "garbage" }), { code: "INVALID_PRIMARY" });
+    await assert.rejects(client.addPrimary({ uri: URI2, rank: 0 }), { code: "INVALID_PARAMS" });
+    await assert.rejects(client.addPrimary({ uri: URI2, fallbackUri: onion }), { code: "INVALID_PRIMARY" });
+    await assert.rejects(client.removePrimary("not-a-key"), { code: "INVALID_PARAMS" });
+    await assert.rejects(client.reorderPrimaries([PK, PK]), { code: "INVALID_PARAMS" });
+    await assert.rejects(client.reorderPrimaries([]), { code: "INVALID_PARAMS" });
+    assert.equal(calls.length, before, "refused before any request");
+  }
+});
+
+test("with ranked primaries a receive that names no peer is steered by the engine, and the one it chose is the one asked to create", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client, calls } = makeClient(rankedOverrides({
+      "/channels": [],
+      "/jit/quote": (_body, query) => {
+        assert.equal(new URLSearchParams(query).has("lspPubkey"), false, "the engine chooses");
+        return { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12, lspPubkey: PK2,
+          skipped: [{ pubkey: PK, rank: 1, stage: "connect", code: "PEER_NOT_CONNECTED", message: "not connected" }] };
+      },
+    }));
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal(quote.peer, PK2);
+    assert.deepEqual(quote.skipped, [{ pubkey: PK, rank: 1, stage: "connect", code: "PEER_NOT_CONNECTED", message: "not connected" }]);
+    assert.ok(quote.warnings.some((w) => w.startsWith("Primary 1 was passed over: not connected")));
+    const request = await client.receive(quote);
+    assert.equal(request.peer, PK2);
+    assert.equal(calls.find((c) => c.path === "/jit/invoice").body.lspPubkey, PK2, "quote and create agree on the peer");
+    // A named peer is asked exactly as before.
+    const { client: named, calls: namedCalls } = makeClient(rankedOverrides({
+      "/channels": [],
+      "/jit/quote": { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12, lspPubkey: PK2 },
+    }));
+    await named.quoteReceive({ amountSats: 10000, peer: PK2 });
+    assert.equal(new URLSearchParams(namedCalls.find((c) => c.path === "/jit/quote").query).get("lspPubkey"), PK2);
+    await assert.rejects(named.quoteReceive({ amountSats: 10000, peer: "nope" }), { code: "INVALID_PARAMS" });
+  }
+});
+
+test("a steered offline quote binds its request to the primary that quoted it, and the engine's refusal when none takes it keeps its code", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client, calls } = makeClient(rankedOverrides({
+      "/api/config": { defaultNetwork: "mainnet", defaultElectrum: null, supportedNetworks: ["mainnet"], lfbwAvailable: true, primariesAvailable: true, offlineReceiveAvailable: true },
+      "/receive/quote": (_body, query) => {
+        assert.equal(new URLSearchParams(query).has("peer"), false);
+        return { available: true, peer: PK2, amountSats: 10000, feeSats: 0, terms: { feeBaseMsat: 0, feePpm: 0 }, expiresAt: NOW + 60000,
+          skipped: [{ pubkey: PK, rank: 1, stage: "attempt", code: "RECEIVE_UNAVAILABLE", message: "no eligible channel" }] };
+      },
+      "/receive/invoice": (body) => {
+        assert.equal(body.peer, PK2);
+        return { bolt11: INVOICE, paymentHash: HASH, offlineReceive: true, requestId: body.requestId };
+      },
+    }));
+    const quote = await client.quoteReceive({ amountSats: 10000, mode: "offline" });
+    assert.equal(quote.peer, PK2);
+    assert.equal(quote.skipped[0].code, "RECEIVE_UNAVAILABLE");
+    const request = await client.receive(quote);
+    assert.equal(request.offlineReceive, true);
+    assert.equal(request.peer, PK2);
+    assert.equal(calls.find((c) => c.path === "/receive/invoice").body.peer, PK2);
+    const { client: none } = makeClient(rankedOverrides({
+      "/channels": [],
+      "/jit/quote": { response: result({ ok: false, error: { code: "NO_PRIMARY_AVAILABLE", message: "no primary took the receive: 1 not connected; 2 declined" } }, 503) },
+    }));
+    await assert.rejects(none.quoteReceive({ amountSats: 10000 }), (error) => error.code === "NO_PRIMARY_AVAILABLE" && /declined/.test(error.message));
+    const { client: down } = makeClient(rankedOverrides({ "/channels": [], "/peers": [] }));
+    await assert.rejects(down.quoteReceive({ amountSats: 10000 }), { code: "PRIMARY_DOWN" });
+  }
+});
+
+test("a Lightning send needs any ranked primary connected, not the first", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client } = makeClient(rankedOverrides({ "/peers": [{ pubkey: PK2, state: "connected" }], "/liquidity": { sendableSats: 5000 } }));
+    await assert.rejects(client.prepareSend({ request: INVOICE }), { code: "INSUFFICIENT_FUNDS" }, "short, but not because a primary is down");
+    const { client: none } = makeClient(rankedOverrides({ "/peers": [], "/liquidity": { sendableSats: 5000 } }));
+    await assert.rejects(none.prepareSend({ request: INVOICE }), (error) => error.code === "PRIMARY_DOWN" && /None of your primary nodes/.test(error.message));
+    const { client: max } = makeClient(rankedOverrides({
+      "/peers": [{ pubkey: PK2, state: "connected" }],
+      "/invoice/decode": { paymentHash: HASH, amountSats: null, timestamp: NOW / 1000 - 60, expiry: 3600 },
+      "/invoice/pay-all/quote": { debitMsat: "490000000", minRecipientMsat: "485100000", maxFeeMsat: "4900000", remainderMsat: "0", routeFound: true },
+    }));
+    const quote = await max.quoteMax({ request: OPEN_INVOICE });
+    assert.equal(quote.amountSats, 485100, "rank 2 connected is enough for a max");
+  }
+});
+
+test("an address no single channel covers is paid out of several channels in one transaction when the engine plans it, and a max stays a one-channel splice", async () => {
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const quotes = [];
+    const { client, calls } = makeClient(rankedOverrides({
+      "/channel/splice-quote": (body) => { quotes.push(body.channelId); return { feeSats: 225, maxAmountSats: 280000 }; },
+      "/channel-send/quote": (body) => {
+        assert.deepEqual(body, { address: ADDRESS, amountSats: 450000, feeratePerkw: 500 });
+        return { quoteId: "q1", kind: "composite", address: ADDRESS, amountSats: 450000, feeSats: 900, totalSats: 450900, feeratePerkw: 500, channels: [{ channelId: "channel-1" }, { channelId: "channel-2" }], skipped: [], expiresAt: NOW + 120000 };
+      },
+      "/channel-send/execute": (body) => {
+        assert.deepEqual(body, { quoteId: "q1" });
+        return { id: "q1", kind: "composite", stage: "NEGOTIATING", address: ADDRESS, amountSats: 450000, feeSats: 900, startedAt: NOW };
+      },
+    }));
+    // The one-channel path first: the largest channel carries what fits it.
+    const single = await client.prepareSend({ request: ADDRESS, amountSats: 200000 });
+    assert.equal(quotes[0], "channel-2", "the usable channel holding the most");
+    assert.equal("channelSend" in single, false);
+    const review = await client.prepareSend({ request: ADDRESS, amountSats: 450000 });
+    assert.deepEqual(review.channelSend, { kind: "composite", channels: 2 });
+    assert.equal(review.feeSats, 900);
+    assert.equal(review.totalSats, 450900);
+    assert.ok(review.warnings.some((w) => /2 channels in one transaction/.test(w)));
+    const sent = await client.send(review);
+    assert.equal(sent.status, "pending");
+    assert.deepEqual(sent.channelSend, { kind: "composite", channels: 2, id: "q1" });
+    assert.equal(sent.feeEstimated, true);
+    assert.equal(calls.filter((c) => c.path === "/channel/splice-out").length, 0);
+    const maximum = await client.quoteMax({ request: ADDRESS });
+    assert.equal(maximum.amountSats, 280000);
+    assert.equal(calls.filter((c) => c.path === "/channel-send/quote").length, 1, "a max never asks for a composite");
+  }
+});
+
+test("a channel send's engine stages read as completed, failed with the reason, or pending, and an engine refusal leaves the ordinary shortfall", async () => {
+  const outcomes = [
+    [{ id: "q1", kind: "composite", stage: "LOCKED", txid: "ef".repeat(32), amountSats: 450000, feeSats: 900 }, "completed"],
+    [{ id: "q1", kind: "composite", stage: "ABORTED", reason: "a peer disconnected", amountSats: 450000, feeSats: 900 }, "failed"],
+    [{ id: "q1", kind: "composite", stage: "RELEASED", amountSats: 450000, feeSats: 900 }, "pending"],
+  ];
+  for (const [response, status] of outcomes) {
+    const { client } = embeddedFixture(rankedOverrides({
+      "/channel/splice-quote": { feeSats: 225, maxAmountSats: 280000 },
+      "/channel-send/quote": { quoteId: "q1", kind: "composite", address: ADDRESS, amountSats: 450000, feeSats: 900, totalSats: 450900, feeratePerkw: 500, channels: [{ channelId: "channel-1" }, { channelId: "channel-2" }], skipped: [], expiresAt: NOW + 120000 },
+      "/channel-send/execute": response,
+    }));
+    const sent = await client.send(await client.prepareSend({ request: ADDRESS, amountSats: 450000 }));
+    assert.equal(sent.status, status);
+    if (status === "completed") assert.equal(sent.txid, "ef".repeat(32));
+    if (status === "failed") assert.match(sent.message, /a peer disconnected/);
+  }
+  const { client: refused, calls } = embeddedFixture(rankedOverrides({
+    "/channel/splice-quote": { feeSats: 225, maxAmountSats: 280000 },
+    "/channel-send/quote": { response: result({ ok: false, error: { code: "SPLICE_REFUSED", message: "no channel qualifies" } }, 409) },
+  }));
+  await assert.rejects(refused.prepareSend({ request: ADDRESS, amountSats: 450000 }), { code: "INSUFFICIENT_FUNDS" });
+  assert.equal(calls.some((c) => c.path === "/channel-send/execute"), false);
+  // The engine may answer that one other channel covers it: that channel is spliced, as before.
+  const { client: single, calls: singleCalls } = embeddedFixture(rankedOverrides({
+    "/channel/splice-quote": { feeSats: 225, maxAmountSats: 100000 },
+    "/channel-send/quote": { quoteId: "q2", kind: "single", address: ADDRESS, amountSats: 150000, feeSats: 300, totalSats: 150300, feeratePerkw: 500, channels: [{ channelId: "channel-1" }], skipped: [], expiresAt: NOW + 120000 },
+  }));
+  const review = await single.prepareSend({ request: ADDRESS, amountSats: 150000 });
+  assert.equal("channelSend" in review, false);
+  assert.equal(review.feeSats, 300);
+  await single.send(review);
+  assert.equal(singleCalls.find((c) => c.path === "/channel/splice-out").body.channelId, "channel-1");
+});
+
+test("the engine's composite sends are one sent row each in Activity, in place of the transaction the merge would read as a channel funding", async () => {
+  const txid = "ef".repeat(32);
+  const { client } = embeddedFixture(rankedOverrides({
+    "/channel-send/list": [{ id: "q1", kind: "composite", stage: "LOCKED", address: ADDRESS, amountSats: 450000, feeSats: 900, startedAt: NOW - 5000, txid }],
+    "/transactions": [{ txid, type: "sent", valueSats: -450900, feeSats: 900, confirmed: true, height: 800000, timestamp: NOW / 1000 }],
+    "/channels": [{ ...channel, fundingTxid: txid }, channel2],
+  }));
+  const snapshot = await client.snapshot();
+  const rows = snapshot.activity.filter((row) => row.txid === txid);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, "channel-send:q1");
+  assert.equal(rows[0].kind, "sent");
+  assert.equal(rows[0].status, "completed");
+  assert.equal(rows[0].amountSats, 450000);
+  assert.deepEqual(rows[0].channelSend, { kind: "composite", id: "q1", stage: "LOCKED" });
+});
+
+test("diagnostics name every ranked primary's connection and each channel's peer rank", async () => {
+  const { client } = fixture(rankedOverrides({ "/peers": [{ pubkey: PK2, state: "connected", transport: "tcp", host: "second.example" }] }));
+  const d = await client.diagnostics();
+  assert.deepEqual(d.primaries, [
+    { pubkey: PK, rank: 1, connected: false, transport: null, rttMs: null },
+    { pubkey: PK2, rank: 2, connected: true, transport: "tcp", rttMs: null },
+  ]);
+  assert.deepEqual(d.channels.map((c) => [c.withPrimary, c.peerRank]), [[true, 1], [true, 2]]);
+  assert.equal(d.primaryConnected, false, "the scalar still speaks for rank 1");
+  const { client: legacy } = fixture();
+  const old = await legacy.diagnostics();
+  assert.equal("primaries" in old, false);
+  assert.equal("peerRank" in old.channels[0], false);
+});
+
+test("the preview ranks primaries in memory with the engine's rules", async () => {
+  const demo = new DemoWalletClient();
+  assert.equal((await demo.getConfig()).primariesAvailable, true);
+  let policy = await demo.listPrimaries();
+  assert.equal(policy.primaries.length, 1);
+  assert.equal(policy.primaries[0].isReceiveTarget, true);
+  policy = await demo.addPrimary({ uri: URI2 });
+  assert.deepEqual(policy.primaries.map((p) => [p.rank, p.pubkey, p.isReceiveTarget]), [[1, PK, true], [2, PK2, false]]);
+  await assert.rejects(demo.addPrimary({ uri: URI2 }), { code: "INVALID_PARAMS" });
+  policy = await demo.setPrimariesThreshold(1000);
+  assert.equal(policy.receiveTarget, PK2, "every primary above the target: the lowest balance takes the receive");
+  policy = await demo.reorderPrimaries([PK2, PK]);
+  assert.deepEqual(policy.primaries.map((p) => p.pubkey), [PK2, PK]);
+  const snapshot = await demo.snapshot();
+  assert.equal(snapshot.primary.uri, URI2, "primary is rank 1");
+  assert.equal(snapshot.primaries.length, 2);
+  assert.equal(snapshot.wallet.lfbw.primaryPubkey, PK2);
+  await demo.updatePrimary(DEFAULT_PRIMARY_URI);
+  assert.deepEqual((await demo.listPrimaries()).primaries.map((p) => p.pubkey), [PK], "replacing rank 1 with a listed node lists it once");
+  await assert.rejects(demo.removePrimary(PK2), { code: "INVALID_PARAMS" });
+  policy = await demo.removePrimary(PK);
+  assert.equal(policy.primaries.length, 0);
+  assert.equal((await demo.snapshot()).primariesReceiveTarget, null);
+});
