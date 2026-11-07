@@ -9,6 +9,9 @@ import {
   type SendResult,
   type ReceiveStatus,
   type WalletRecoveryStatus,
+  type PrimariesPolicy,
+  type PrimaryStatus,
+  type ReceiveSteerSkip,
 } from "../src/index.js";
 const connection: Connection = {
   url: "http://127.0.0.1:8787",
@@ -65,6 +68,20 @@ async function verifyContract(
   void rate;
   void marks;
   void (await client.quoteMax({ request: receive.address!, feeRate: 3 }));
+  const policy: PrimariesPolicy = await client.listPrimaries();
+  const target: boolean | undefined = policy.primaries[0]?.isReceiveTarget;
+  const steered = await client.quoteReceive({ amountSats: 1000, peer: policy.primaries[0]?.pubkey });
+  const skipped: ReceiveSteerSkip[] | undefined = steered.skipped;
+  const composite: number | undefined = review.channelSend?.channels;
+  const ranked: PrimaryStatus[] | undefined = snapshot.primaries;
+  void target;
+  void skipped;
+  void composite;
+  void ranked;
+  void (await client.addPrimary({ uri: policy.primaries[0]?.uri ?? "", rank: 1 }));
+  void (await client.reorderPrimaries(policy.primaries.map((p) => p.pubkey)));
+  void (await client.setPrimariesThreshold(null));
+  void (await client.removePrimary(policy.primaries[0]?.pubkey ?? ""));
   return client.send(review);
 }
 const localClient: WalletClientInterface = new EmbeddedWalletClient({

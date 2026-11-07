@@ -28,6 +28,29 @@ export interface WalletRecord {
     trusted?: boolean;
     offlineReceiveAvailable?: boolean | null;
     offlineReceiveReason?: string | null;
+    /**
+     * The ranked primaries as the wallet record mirrors the engine's list,
+     * rank 1 first, each with the facts the engine does not hold (trust, an
+     * onion fallback for an Iroh primary, its setup state) and whether it is
+     * connected. Absent on an engine with one primary (the scalar fields above).
+     */
+    primaries?: Array<{
+      pubkey: string;
+      uri: string | null;
+      fallbackUri?: string | null;
+      trusted?: boolean;
+      setup?: string;
+      setupError?: string;
+      connected?: boolean;
+      offlineReceiveAvailable?: boolean | null;
+      offlineReceiveReason?: string | null;
+    }>;
+    /** The fill threshold in sats; null means no cap (the first-ranked primary always takes the receive). */
+    primariesThresholdSat?: number | null;
+    /** The primary a receive that names no peer goes to, or null with none. */
+    receiveTarget?: string | null;
+    /** Peers this wallet still holds live channels with that are not ranked primaries; their balance stays in the total. */
+    retainedPeers?: Array<{ pubkey: string; channelCount: number; balanceSat: number }>;
     /** A payer this wallet has not paired with is growing the home channel; the splice locks at depth. */
     unpairedFunding?: { at: number };
     /** The home channel's last splice conflict or revert, while it is worth telling. */
@@ -84,6 +107,59 @@ export interface Activity {
   receiveRequest?: ReceiveRequestDetails;
   receiveStatus?: ReceiveStatus;
   receiveStatusUnavailable?: boolean;
+  /** An address paid out of several channels in one transaction: the engine's channel-send record behind this row. */
+  channelSend?: { kind: "single" | "composite"; id: string; stage?: string };
+}
+/** Why one ranked primary did not take a steered receive. */
+export interface ReceiveSteerSkip {
+  pubkey: string;
+  /** 1-based configured rank. */
+  rank: number;
+  /** `budget`: not tried, the walk's budget ran out before it. */
+  stage: "connect" | "attempt" | "budget";
+  code: string;
+  message: string;
+}
+/** One ranked primary as the engine and the wallet record know it now. */
+export interface PrimaryStatus {
+  pubkey: string;
+  /** 1 is the highest rank. */
+  rank: number;
+  uri: string;
+  /** A v3 onion address for the same key, for an Iroh primary. */
+  fallbackUri?: string | null;
+  connected: boolean;
+  setup: string;
+  /** Safe user-facing diagnostic; absent when setup has no recorded error. */
+  setupError?: string;
+  trusted?: boolean;
+  /** Our local balance summed over our usable channels with it. */
+  balanceSat: number;
+  channelCount: number;
+  belowThreshold?: boolean;
+  /** Whether a receive that names no peer would go to this primary. */
+  isReceiveTarget: boolean;
+  /** 1-based position in the order a receive tries the primaries. */
+  selectionOrder: number;
+  offlineReceiveAvailable?: boolean | null;
+  offlineReceiveReason?: string | null;
+}
+/** The ranked primaries policy: the engine owns it, the apps display and edit it. */
+export interface PrimariesPolicy {
+  /** Sats of local balance a primary is filled to before receives move on; null means no cap. */
+  thresholdSat: number | null;
+  /** The pubkey a receive that names no peer would go to, or null with no primaries. */
+  receiveTarget: string | null;
+  /** Rank order. */
+  primaries: PrimaryStatus[];
+}
+export interface AddPrimaryInput {
+  /** `pubkey@host:port` or `pubkey@iroh:endpoint-id`. */
+  uri: string;
+  /** A v3 onion address for the same key, for an Iroh primary. */
+  fallbackUri?: string | null;
+  /** 1-based rank to insert at; the default is last. */
+  rank?: number;
 }
 export interface WalletSnapshot {
   wallet: WalletRecord;
@@ -132,6 +208,14 @@ export interface WalletSnapshot {
     /** Safe user-facing diagnostic; absent when setup has no recorded error. */
     setupError?: string;
   };
+  /**
+   * The ranked primaries, rank 1 first, when the engine ranks them
+   * (`getConfig().primariesAvailable`); `primary` above is rank 1.
+   */
+  primaries?: PrimaryStatus[];
+  primariesThresholdSat?: number | null;
+  /** The primary a receive that names no peer would go to. */
+  primariesReceiveTarget?: string | null;
   notes: string[];
   updatedAt: number;
   demo: boolean;
@@ -224,6 +308,11 @@ export interface SendReview {
   feeRate?: number;
   /** A Bitcoin splice only: the engine's estimates at quote time, for choosing another rate. */
   feeRates?: FeeRates;
+  /**
+   * A Bitcoin payment out of several channels in one transaction (the
+   * engine's channel-send plan), when no single channel covers the amount.
+   */
+  channelSend?: { kind: "composite"; channels: number };
   expiresAt: number;
   warnings: string[];
 }
@@ -238,6 +327,8 @@ export interface SendResult {
   drain?: DrainProgress;
   txid?: string;
   paymentHash?: string;
+  /** The engine's channel-send record behind a payment out of several channels. */
+  channelSend?: { kind: "composite"; channels: number; id: string };
   message: string;
 }
 export interface OfflineReservation {
@@ -260,10 +351,19 @@ export interface ReceiveInput {
    * it requires advertised support and never falls back to unified.
    */
   mode?: "unified" | "offline";
+  /**
+   * The primary (33-byte pubkey, hex) to quote at. Omitted, the engine's
+   * ranked primaries choose, and the quote names the one that took it.
+   */
+  peer?: string;
 }
 export interface ReceiveQuote {
   mode?: "offline";
   concurrentVersion?: 1 | 2;
+  /** The primary that took a JIT or offline quote (the one named, or the one the ranked list chose). */
+  peer?: string;
+  /** Steered quotes only: the primaries passed over before this one. */
+  skipped?: ReceiveSteerSkip[];
   id: string;
   amountSats: number | null;
   description: string;
@@ -274,6 +374,8 @@ export interface ReceiveQuote {
 }
 export interface ReceiveRequest {
   offlineReceive?: boolean;
+  /** The primary a JIT or offline request was created with. */
+  peer?: string;
   id: string;
   uri: string;
   address?: string;
@@ -347,6 +449,10 @@ export interface HostConfig {
   drainAvailable?: boolean;
   recoveryAvailable?: boolean;
   recoveryAutoApplyAvailable?: boolean;
+  /** The engine ranks several primaries and steers receives through them. */
+  primariesAvailable?: boolean;
+  /** An address can be paid out of several channels in one transaction. */
+  channelSendAvailable?: boolean;
   engineVersion?: string;
 }
 export interface CreatedWallet extends WalletRecord {
@@ -399,10 +505,22 @@ export interface WalletDiagnostics {
   /** The network map routes are found on (GET /graph/info). */
   graph?: { nodes: number; channels: number; lastSyncAt: number | null } | null;
   utxos?: { valueSats: number; height: number }[] | null;
+  /** Each ranked primary's connection, when the engine ranks them. */
+  primaries?:
+    | {
+        pubkey: string;
+        rank: number;
+        connected: boolean;
+        transport: 'iroh-direct' | 'iroh-relay' | 'iroh-unknown' | 'tor' | 'tcp' | 'ws' | null;
+        rttMs: number | null;
+      }[]
+    | null;
   channels?:
     | {
         channelId: string;
         withPrimary: boolean;
+        /** The configured rank of the channel's peer, or null when it is not a ranked primary. */
+        peerRank?: number | null;
         state: string;
         htlcUsable: boolean | null;
         fundingConfirmed: boolean | null;
@@ -450,6 +568,11 @@ export interface WalletClientInterface {
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
   updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
+  listPrimaries(): Promise<PrimariesPolicy>;
+  addPrimary(input: AddPrimaryInput): Promise<PrimariesPolicy>;
+  removePrimary(pubkey: string): Promise<PrimariesPolicy>;
+  reorderPrimaries(pubkeys: string[]): Promise<PrimariesPolicy>;
+  setPrimariesThreshold(sats: number | null): Promise<PrimariesPolicy>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
@@ -504,6 +627,11 @@ export class WalletClient implements WalletClientInterface {
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
   updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
+  listPrimaries(): Promise<PrimariesPolicy>;
+  addPrimary(input: AddPrimaryInput): Promise<PrimariesPolicy>;
+  removePrimary(pubkey: string): Promise<PrimariesPolicy>;
+  reorderPrimaries(pubkeys: string[]): Promise<PrimariesPolicy>;
+  setPrimariesThreshold(sats: number | null): Promise<PrimariesPolicy>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
@@ -534,6 +662,11 @@ export class DemoWalletClient implements WalletClientInterface {
     expectedPaymentHash?: string,
   ): Promise<ReceiveRequest>;
   updatePrimary(uri: string, fallbackUri?: string): Promise<WalletRecord>;
+  listPrimaries(): Promise<PrimariesPolicy>;
+  addPrimary(input: AddPrimaryInput): Promise<PrimariesPolicy>;
+  removePrimary(pubkey: string): Promise<PrimariesPolicy>;
+  reorderPrimaries(pubkeys: string[]): Promise<PrimariesPolicy>;
+  setPrimariesThreshold(sats: number | null): Promise<PrimariesPolicy>;
   startWallet(): Promise<void>;
   refreshWallet(): Promise<void>;
   retrySetup(): Promise<void>;
