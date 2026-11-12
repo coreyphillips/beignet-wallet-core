@@ -80,6 +80,10 @@ An engine that ranks several primaries (Beignet 0.37.0 and later, the portable e
 
 `validatePrimaryUri` and `parsePrimaryUri` accept Iroh pairing URIs, including canonical base32 or hex endpoint IDs and an optional HTTP(S) relay hint. `updatePrimary(uri, fallbackUri)` optionally configures a v3 onion address for the same Lightning public key. Omitting or clearing the fallback removes it. Snapshots expose `primary.fallbackUri`; diagnostics report `iroh-direct`, `iroh-relay`, `iroh-unknown`, or `tor` for a selected fallback, with an optional RTT. The runtime must provide an Iroh endpoint factory to use this transport.
 
+## Porch links
+
+`validatePrimaryUri` and `parsePrimaryUri` accept a Porch link, `pubkey@wss://relay[:port]/v1/p/<route id>`: the node waits at a blind relay and the link names the relay, not the node (Beignet 0.39.0 hosts them; `docs/PORCH.md` there). It is the one shape of WebSocket address accepted. `ws://` is taken only for a relay on this device or its own network, an onion relay is refused, and so is anything after the route id. The parsed result carries `transport: { type: "ws", url }`, the relay's `host` and `port` 0, since the relay's address is never a TCP address for the node. `addPrimary` sends such a primary as its `uri`, so the route is kept. A Porch primary takes no onion fallback. The relay sees the address of whoever dials it; the node does not. Diagnostics report `ws` for a connected one.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

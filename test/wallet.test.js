@@ -5296,6 +5296,15 @@ test('primary diagnostics identify Iroh paths and a selected Tor fallback', asyn
  assert.equal((await client.diagnostics()).primaryTransport, 'tor');
 });
 
+test('primary diagnostics name a Porch link as a WebSocket connection to the relay', async () => {
+ const porch = `${PK}@wss://relay.example/v1/p/${'k'.repeat(32)}`;
+ const rec = { ...record, lfbw: { ...record.lfbw, primaryUri: porch } };
+ const { client } = fixture({ '/api/wallets/wallet-1': rec, '/peers': [{ pubkey: PK, state: 'connected', transport: 'ws', host: 'relay.example', port: 443 }] });
+ const report = await client.diagnostics();
+ assert.equal(report.primaryTransport, 'ws');
+ assert.equal(report.primaryConnected, true);
+});
+
 
 test("primary update persists and clears same-key Iroh fallback before sending configuration", async () => {
   const uri = `${PK}@iroh:${"b".repeat(64)}`;
@@ -6018,9 +6027,12 @@ test("policy writes carry the daemon's bodies, refuse malformed input before any
     const irohKey = "02" + "cc".repeat(32);
     const iroh = `${irohKey}@iroh:${"c".repeat(64)}`;
     const onion = `${irohKey}@${"c".repeat(56)}.onion:9735`;
+    const porchKey = "03" + "ee".repeat(32);
+    const porch = `${porchKey}@wss://relay.example/v1/p/${"k".repeat(32)}`;
     const review = await client.prepareSend({ request: ADDRESS, amountSats: 5000 });
     await client.addPrimary({ uri: URI2.replace(PK2, "02" + "dd".repeat(32)), rank: 1 });
     await client.addPrimary({ uri: iroh, fallbackUri: onion });
+    await client.addPrimary({ uri: porch.replace("wss://relay.example", "WSS://Relay.Example:443"), rank: 2 });
     await client.removePrimary(PK2.toUpperCase());
     await client.reorderPrimaries([PK2, PK]);
     await client.setPrimariesThreshold(250000);
@@ -6028,6 +6040,8 @@ test("policy writes carry the daemon's bodies, refuse malformed input before any
     assert.deepEqual(calls.filter((c) => c.path.startsWith("/primaries/")).map((c) => [c.path, c.body]), [
       ["/primaries/add", { pubkey: "02" + "dd".repeat(32), host: "second.example", port: 9736, trusted: true, rank: 1 }],
       ["/primaries/add", { pubkey: irohKey, uri: iroh, fallbackUri: onion, trusted: true }],
+      // A Porch link goes as its URI: host and port alone would lose the route.
+      ["/primaries/add", { pubkey: porchKey, uri: porch, trusted: true, rank: 2 }],
       ["/primaries/remove", { pubkey: PK2 }],
       ["/primaries/reorder", { order: [PK2, PK] }],
       ["/primaries/threshold", { fillThresholdSat: 250000 }],
@@ -6040,6 +6054,8 @@ test("policy writes carry the daemon's bodies, refuse malformed input before any
     await assert.rejects(client.addPrimary({ uri: "garbage" }), { code: "INVALID_PRIMARY" });
     await assert.rejects(client.addPrimary({ uri: URI2, rank: 0 }), { code: "INVALID_PARAMS" });
     await assert.rejects(client.addPrimary({ uri: URI2, fallbackUri: onion }), { code: "INVALID_PRIMARY" });
+    await assert.rejects(client.addPrimary({ uri: porch, fallbackUri: onion.replace(irohKey, porchKey) }), { code: "INVALID_PRIMARY" });
+    await assert.rejects(client.addPrimary({ uri: porch.replace("wss://", "ws://") }), { code: "INVALID_PRIMARY" });
     await assert.rejects(client.removePrimary("not-a-key"), { code: "INVALID_PARAMS" });
     await assert.rejects(client.reorderPrimaries([PK, PK]), { code: "INVALID_PARAMS" });
     await assert.rejects(client.reorderPrimaries([]), { code: "INVALID_PARAMS" });
