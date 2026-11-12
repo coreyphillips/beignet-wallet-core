@@ -632,10 +632,16 @@ function parseBip21(text, warnings, opts) {
 			// what a damaged copy and paste produces.
 			return refuse('MALFORMED_PERCENT_ENCODING');
 		}
+		// BIP 321 reads a field's name in any case, and a request written for a
+		// dense QR is often capitals throughout. A name this wallet knows is kept
+		// in lower case, so AMOUNT is the amount and never a field passed over,
+		// and two spellings of one field meet the rule for a field written twice.
+		const known = key.toLowerCase();
+		if (KNOWN_PARAMS.has(known)) key = known;
 		// A field with no '=' at all is usually the tail of a message with an
 		// unescaped & in it, which means the message on screen is not the message
 		// that was written.
-		if (eq === -1 && !KNOWN_PARAMS.has(key.toLowerCase())) warn(warnings, 'TEXT_PARAM_TRUNCATED');
+		if (eq === -1 && !KNOWN_PARAMS.has(known)) warn(warnings, 'TEXT_PARAM_TRUNCATED');
 		if (params.has(key)) {
 			duplicated.set(key, (duplicated.get(key) || []).concat(value));
 			continue; // first one wins
@@ -644,22 +650,12 @@ function parseBip21(text, warnings, opts) {
 	}
 
 	for (const key of params.keys()) {
-		const lower = key.toLowerCase();
 		// BIP21 reserves req- for fields a payer must understand to pay correctly.
 		// Not understanding one is precisely the case it was invented for.
-		if (lower.startsWith('req-')) {
+		if (key.toLowerCase().startsWith('req-')) {
 			return refuse(
 				'UNSUPPORTED_REQ_PARAM',
 				`This payment request requires "${key}", which this wallet does not support. Paying it could pay the wrong thing.`
-			);
-		}
-		// A key that differs from a field this wallet knows only by case would be
-		// silently ignored, and silently ignoring an amount is how the wrong sum
-		// gets sent.
-		if (key !== lower && KNOWN_PARAMS.has(lower)) {
-			return refuse(
-				'PARAM_CASE_MISMATCH',
-				`This payment request writes "${key}" in capitals, so its value cannot be trusted to mean what it looks like. Ask for a new one.`
 			);
 		}
 	}

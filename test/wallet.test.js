@@ -251,6 +251,58 @@ test("routing rejects wrong networks, bidi controls, duplicate conflicting amoun
   assert.equal(parsePayment(fractional).code, "FRACTIONAL_SAT_INVOICE");
 });
 
+test("a bitcoin: request's field names are read in any case, as BIP 321 writes them", () => {
+  const CAPITALS = INVOICE.toUpperCase();
+  // Lightning alone, the shape a till presents, however much of it is capitals.
+  for (const request of [
+    `bitcoin:?LIGHTNING=${CAPITALS}`,
+    `BITCOIN:?LIGHTNING=${CAPITALS}`,
+    `bitcoin:?Lightning=${INVOICE}`,
+  ]) {
+    const parsed = parsePayment(request);
+    assert.equal(parsed.kind, "bolt11", request);
+    assert.equal(parsed.invoice, INVOICE, request);
+    assert.equal(parsed.amountSats, 10000, request);
+  }
+  // A whole unified request in capitals, as a dense QR writes it.
+  const unified = parsePayment(
+    `BITCOIN:${ADDRESS.toUpperCase()}?AMOUNT=0.0001&LIGHTNING=${CAPITALS}`,
+  );
+  assert.equal(unified.kind, "onchain");
+  assert.equal(unified.address, ADDRESS);
+  assert.equal(unified.amountSats, 10000);
+  assert.equal(unified.lightning.invoice, INVOICE);
+  // The words a payee wrote keep the case they were written in.
+  const worded = parsePayment(
+    `bitcoin:${ADDRESS}?AMOUNT=0.0001&LABEL=Cafe&MESSAGE=Two%20flat%20whites`,
+  );
+  assert.equal(worded.amountSats, 10000);
+  assert.equal(worded.label, "Cafe");
+  assert.equal(worded.message, "Two flat whites");
+  // One field under two spellings is one field written twice: two amounts
+  // that differ are refused, and two that agree are one amount.
+  assert.equal(
+    parsePayment(`bitcoin:${ADDRESS}?amount=0.0001&AMOUNT=0.0002`).code,
+    "DUPLICATE_AMOUNT",
+  );
+  const twice = parsePayment(`bitcoin:${ADDRESS}?amount=0.0001&AMOUNT=0.0001`);
+  assert.equal(twice.amountSats, 10000);
+  assert.ok(twice.warnings.some((warning) => warning.code === "DUPLICATE_PARAM"));
+  // An amount in capitals is still held against the invoice beside it.
+  assert.equal(
+    parsePayment(
+      `BITCOIN:${ADDRESS.toUpperCase()}?AMOUNT=0.0002&LIGHTNING=${CAPITALS}`,
+    ).code,
+    "AMOUNT_CONFLICT",
+  );
+  assert.equal(parsePayment(`bitcoin:${ADDRESS}?AMOUNT`).code, "AMOUNT_EMPTY");
+  // A field a payer must understand is refused in any case, as before.
+  assert.equal(
+    parsePayment(`bitcoin:${ADDRESS}?REQ-FOO=1`).code,
+    "UNSUPPORTED_REQ_PARAM",
+  );
+});
+
 test("connection credentials never ride URL and nonlocal cleartext is refused", () => {
   for (const url of [
     "http://192.168.1.2:8787",
@@ -568,6 +620,23 @@ test("prepare/send picks BIP21 Lightning, caps fee, is single use and no signatu
   assert.equal(payment.headers.Authorization, "Bearer test-token");
   assert.equal(payment.redirect, "error");
   await assert.rejects(client.send(review), { code: "INVALID_REVIEW" });
+  await assert.rejects(client.prepareSend({ request: INVOICE }), {
+    code: "ALREADY_SUBMITTED",
+  });
+});
+
+test("a Lightning request written all in capitals is reviewed and paid as the invoice it carries", async () => {
+  const { client, calls } = fixture();
+  const review = await client.prepareSend({
+    request: `BITCOIN:?LIGHTNING=${INVOICE.toUpperCase()}`,
+  });
+  assert.equal(review.route, "lightning");
+  assert.equal(review.amountSats, 10000);
+  const sent = await client.send(review);
+  assert.equal(sent.status, "completed");
+  const payment = calls.find((c) => c.path === "/invoice/pay-safe");
+  assert.equal(payment.body.bolt11, INVOICE);
+  // The same invoice, bare, is the request already paid.
   await assert.rejects(client.prepareSend({ request: INVOICE }), {
     code: "ALREADY_SUBMITTED",
   });
