@@ -154,7 +154,7 @@ export interface PrimariesPolicy {
   primaries: PrimaryStatus[];
 }
 export interface AddPrimaryInput {
-  /** `pubkey@host:port` or `pubkey@iroh:endpoint-id`. */
+  /** `pubkey@host:port`, `pubkey@iroh:endpoint-id` or a Porch link, `pubkey@wss://relay/v1/p/route-id`. */
   uri: string;
   /** A v3 onion address for the same key, for an Iroh primary. */
   fallbackUri?: string | null;
@@ -770,7 +770,10 @@ export interface ParsedPrimary {
   host: string;
   port: number;
   uri: string;
-  transport?: { type: "iroh"; endpointId: string; relayUrl?: string };
+  transport?:
+    | { type: "iroh"; endpointId: string; relayUrl?: string }
+    /** A Porch link: the relay's WebSocket URL with the node's route id. `host` is the relay's and `port` is 0. */
+    | { type: "ws"; url: string };
 }
 export function parsePrimaryUri(input: string): ParsedPrimary;
 export function parsePrimaryFallback(primary: ParsedPrimary, input?: string): ParsedPrimary | undefined;
