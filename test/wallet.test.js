@@ -22,6 +22,7 @@ import {
 import {
   base64urlDecode,
   base64urlEncode,
+  decodeFundingEnvelope,
   encodeFundingEnvelope,
 } from "../src/funding-envelope.js";
 
@@ -301,6 +302,68 @@ test("a bitcoin: request's field names are read in any case, as BIP 321 writes t
     parsePayment(`bitcoin:${ADDRESS}?REQ-FOO=1`).code,
     "UNSUPPORTED_REQ_PARAM",
   );
+});
+
+test("a funding envelope that was put into capitals with its request is not read", () => {
+  // Base64url keeps a capital and a small letter apart, and an envelope has
+  // no check of its own, so this one still decodes after the folding: to
+  // another amount, another expiry and no chain.
+  const envelope = encodeFundingEnvelope({
+    nodeId: PK,
+    expiresAt: NOW + 600000,
+    amountSats: 10000,
+    requestId: "40" + "11".repeat(15),
+  });
+  const garbled = decodeFundingEnvelope(envelope.toUpperCase());
+  assert.ok(garbled, "the folded envelope still decodes");
+  assert.notEqual(garbled.amountSats, 10000);
+  assert.equal(garbled.network, null);
+  // A moment at which the garbled expiry has not passed.
+  const now = garbled.expiresAt - 1;
+
+  const written = `bitcoin:${ADDRESS}?bgnq=${envelope}`;
+  const read = parsePayment(written, { network: "mainnet", now: NOW });
+  assert.equal(read.amountSats, 10000);
+  assert.equal(read.funding.amountSats, 10000);
+
+  // The whole request in capitals, as a dense QR or a tag writes it. The
+  // address is paid as an ordinary transaction, for no amount the envelope
+  // seems to name.
+  for (const opts of [{ now }, { network: "mainnet", now }]) {
+    const capitals = parsePayment(written.toUpperCase(), opts);
+    assert.equal(capitals.kind, "onchain");
+    assert.equal(capitals.address, ADDRESS);
+    assert.equal(capitals.funding, null);
+    assert.equal(capitals.amountSats, null);
+    assert.ok(capitals.warnings.some((warning) => warning.code === "FUNDING_UNREADABLE"));
+  }
+  // Beside an amount, the amount stands, and is not said to conflict.
+  const priced = parsePayment(
+    `BITCOIN:${ADDRESS.toUpperCase()}?AMOUNT=0.0001&BGNQ=${envelope.toUpperCase()}`,
+    { network: "mainnet", now },
+  );
+  assert.equal(priced.kind, "onchain");
+  assert.equal(priced.amountSats, 10000);
+  assert.equal(priced.funding, null);
+  // The name alone in capitals is the same sign: the receiver never wrote it.
+  const renamed = parsePayment(`bitcoin:${ADDRESS}?BGNQ=${envelope}`, { network: "mainnet", now: NOW });
+  assert.equal(renamed.funding, null);
+  assert.equal(renamed.amountSats, null);
+  assert.ok(renamed.warnings.some((warning) => warning.code === "FUNDING_UNREADABLE"));
+  // Written twice, the first spelling is the one read, as for any field.
+  const twice = parsePayment(`bitcoin:${ADDRESS}?bgnq=${envelope}&BGNQ=${envelope.toUpperCase()}`, {
+    network: "mainnet",
+    now: NOW,
+  });
+  assert.equal(twice.funding.amountSats, 10000);
+
+  // The same damage under the name as written: the envelope names no chain
+  // this wallet can be on, so it is not for this one.
+  const unnamed = parsePayment(`bitcoin:${ADDRESS}?bgnq=${envelope.toUpperCase()}`, { network: "mainnet", now });
+  assert.equal(unnamed.kind, "onchain");
+  assert.equal(unnamed.funding, null);
+  assert.equal(unnamed.amountSats, null);
+  assert.ok(unnamed.warnings.some((warning) => warning.code === "FUNDING_WRONG_CHAIN"));
 });
 
 test("connection credentials never ride URL and nonlocal cleartext is refused", () => {
