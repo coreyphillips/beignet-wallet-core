@@ -619,6 +619,9 @@ function parseBip21(text, warnings, opts) {
 	// are a contradiction or one clumsy encoder writing the same figure twice
 	// cannot be answered without them.
 	const duplicated = new Map();
+	// Whether the funding request's field name arrived in another case than
+	// the one it is written in. See where the envelope is read, below.
+	let fundingFolded = false;
 	for (const pair of query.split('&')) {
 		if (!pair) continue;
 		const eq = pair.indexOf('=');
@@ -632,34 +635,32 @@ function parseBip21(text, warnings, opts) {
 			// what a damaged copy and paste produces.
 			return refuse('MALFORMED_PERCENT_ENCODING');
 		}
+		// BIP 321 reads a field's name in any case, and a request written for a
+		// dense QR is often capitals throughout. A name this wallet knows is kept
+		// in lower case, so AMOUNT is the amount and never a field passed over,
+		// and two spellings of one field meet the rule for a field written twice.
+		const raw = key;
+		const known = key.toLowerCase();
+		if (KNOWN_PARAMS.has(known)) key = known;
 		// A field with no '=' at all is usually the tail of a message with an
 		// unescaped & in it, which means the message on screen is not the message
 		// that was written.
-		if (eq === -1 && !KNOWN_PARAMS.has(key.toLowerCase())) warn(warnings, 'TEXT_PARAM_TRUNCATED');
+		if (eq === -1 && !KNOWN_PARAMS.has(known)) warn(warnings, 'TEXT_PARAM_TRUNCATED');
 		if (params.has(key)) {
 			duplicated.set(key, (duplicated.get(key) || []).concat(value));
 			continue; // first one wins
 		}
+		if (key === 'bgnq' && raw !== key) fundingFolded = true;
 		params.set(key, value);
 	}
 
 	for (const key of params.keys()) {
-		const lower = key.toLowerCase();
 		// BIP21 reserves req- for fields a payer must understand to pay correctly.
 		// Not understanding one is precisely the case it was invented for.
-		if (lower.startsWith('req-')) {
+		if (key.toLowerCase().startsWith('req-')) {
 			return refuse(
 				'UNSUPPORTED_REQ_PARAM',
 				`This payment request requires "${key}", which this wallet does not support. Paying it could pay the wrong thing.`
-			);
-		}
-		// A key that differs from a field this wallet knows only by case would be
-		// silently ignored, and silently ignoring an amount is how the wrong sum
-		// gets sent.
-		if (key !== lower && KNOWN_PARAMS.has(lower)) {
-			return refuse(
-				'PARAM_CASE_MISMATCH',
-				`This payment request writes "${key}" in capitals, so its value cannot be trusted to mean what it looks like. Ask for a new one.`
 			);
 		}
 	}
@@ -708,12 +709,23 @@ function parseBip21(text, warnings, opts) {
 	// names another chain is dropped with a warning and the address is paid
 	// as an ordinary transaction, which is what the request's author expects
 	// of a wallet that cannot honor it.
+	//
+	// An envelope is base64url, where a capital and a small letter are two
+	// different values, and it carries no check of its own. One that was put
+	// into capitals with the rest of its request still decodes more often than
+	// not, to another amount and another expiry. Its field name is the sign of
+	// that: BGNQ was written by whatever folded the string, never by the
+	// receiver. Such an envelope is not read at all.
+	//
+	// The same damage with the name left alone shows in the chain: a wallet
+	// knows the hash of every chain it can be on, so an envelope that names
+	// none of them is not for this one.
 	let funding = null;
 	const fundingValue = params.get('bgnq');
 	if (fundingValue) {
-		const env = decodeFundingEnvelope(fundingValue);
+		const env = fundingFolded ? null : decodeFundingEnvelope(fundingValue);
 		if (!env) warn(warnings, 'FUNDING_UNREADABLE');
-		else if (opts.network && env.network && env.network !== opts.network) warn(warnings, 'FUNDING_WRONG_CHAIN');
+		else if (opts.network && env.network !== opts.network) warn(warnings, 'FUNDING_WRONG_CHAIN');
 		else if (env.expiresAt <= (opts.now ?? Date.now())) warn(warnings, 'FUNDING_EXPIRED');
 		else {
 			funding = {
