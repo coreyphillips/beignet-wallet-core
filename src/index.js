@@ -226,6 +226,22 @@ function feeRatesOf(fees) {
 }
 const text = (value) => (typeof value === "string" ? value : "");
 const boundedDescription = (value) => text(value).trim().slice(0, 256);
+// The description of an invoice this wallet asks the engine to make. BOLT 1
+// lets it carry no control, format, surrogate, private-use or unassigned
+// character, and Beignet 0.41.0 refuses one that does
+// (coreyphillips/beignet#2074). A note typed on a phone can hold a line
+// break, or a joined emoji (U+200D, a format character), so line breaks and
+// tabs become a space and the rest are left out. A cut that would end on half
+// of a surrogate pair drops that half too.
+const receiveDescription = (value) => {
+  let description = text(value)
+    .replace(/[\t\n\v\f\r\u0085\u2028\u2029]+/g, " ")
+    .replace(/\p{C}/gu, "")
+    .trim()
+    .slice(0, 256);
+  if (/[\uD800-\uDBFF]$/.test(description)) description = description.slice(0, -1);
+  return description.trimEnd();
+};
 const receiveFee = (amount, flat, ppm) =>
   Number(
     BigInt(integerField(flat, "receive fee")) +
@@ -3045,7 +3061,7 @@ export class WalletClient {
     requires(!previous?.inFlight, "This request is still being prepared.", "RECEIVE_BUSY");
     const epoch = this._epoch;
     const amount = amountOptional(amountSats);
-    const requestedDescription = boundedDescription(description);
+    const requestedDescription = receiveDescription(description);
     requires(!previous || (previous.walletId === this.connection.walletId && previous.plan === "offline" && previous.quote.amountSats === amount && previous.quote.description === requestedDescription),
       "This request ID belongs to a different payment request.", "INVALID_REVIEW");
     const rec = await this._record();
@@ -3175,7 +3191,7 @@ export class WalletClient {
     const quote = {
       id: quoteId,
       amountSats: amount,
-      description: boundedDescription(description),
+      description: receiveDescription(description),
       feeSats,
       netSats: amount == null ? null : amount - feeSats,
       expiresAt: this._now() + 60000,
@@ -3234,7 +3250,7 @@ export class WalletClient {
       requires(Array.isArray(existing?.requests), "Stored receive requests could not be read. Reconnect before retrying.", "INVALID_RESPONSE");
       const saved = existing.requests.find(request => request.id === quote.id);
       if (saved) {
-        requires(saved.offlineReceive === true && saved.amountSats === quote.amountSats && boundedDescription(saved.description) === quote.description,
+        requires(saved.offlineReceive === true && saved.amountSats === quote.amountSats && receiveDescription(saved.description) === quote.description,
           "This request ID belongs to a different payment request.", "INVALID_REVIEW");
         const result = publicStoredRequest(saved);
         await validateRetry(result);
@@ -4650,7 +4666,7 @@ export class DemoWalletClient {
     const quote = {
       id: uid(),
       amountSats: amount,
-      description: boundedDescription(description),
+      description: receiveDescription(description),
       feeSats: 0,
       netSats: amount,
       expiresAt: Date.now() + 60000,

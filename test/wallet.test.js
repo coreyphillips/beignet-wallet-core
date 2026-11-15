@@ -961,6 +961,30 @@ test("receive reuses inbound capacity and returns unified URI with signed fundin
   await assert.rejects(client.receive(quote), { code: "INVALID_REVIEW" });
 });
 
+test("a receive note's line breaks, tabs and format characters never reach the engine's invoice description", async () => {
+  const { client, calls } = fixture();
+  // A line break, a tab, a family emoji joined with U+200D and a bidi
+  // override: BOLT 1 forbids all of them in a description, and Beignet
+  // 0.41.0 refuses to make such an invoice.
+  const note = "Lunch\r\nwith\tAlex \u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u202E!";
+  const quote = await client.quoteReceive({ amountSats: 10000, description: note });
+  assert.equal(quote.description, "Lunch with Alex \u{1F468}\u{1F469}\u{1F467}!");
+  const request = await client.receive(quote);
+  const created = calls.find((c) => ["/invoice/create", "/jit/invoice", "/receive/invoice"].includes(c.path));
+  assert.ok(created, "an invoice was asked for");
+  assert.equal(created.body.description, quote.description);
+  assert.doesNotMatch(created.body.description, /[\p{C}\u2028\u2029]/u);
+  assert.equal(request.description, quote.description);
+});
+
+test("a receive note cut at its length limit never ends on half of an emoji", async () => {
+  const { client } = fixture();
+  const quote = await client.quoteReceive({ amountSats: 10000, description: "a" + "\u{1F600}".repeat(200) });
+  assert.ok(quote.description.length <= 256);
+  assert.doesNotMatch(quote.description, /\p{Cs}/u);
+  assert.equal(quote.description, "a" + "\u{1F600}".repeat(127));
+});
+
 test("receive without inbound requires online primary and quoted fee policy is capped with exact ceil rounding", async () => {
   const { client, calls } = fixture({
     "/channels": [],
