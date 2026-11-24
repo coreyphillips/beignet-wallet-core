@@ -122,16 +122,17 @@ function funderBufferSats(c) {
  * of capacity, the BOLT 2 default. One that does not say who opened is taken
  * to be on a channel the primary opened, which is how a JIT channel starts.
  * Both fallbacks err low: that costs a JIT quote, where erring high mints an
- * invoice the channel cannot carry.
+ * invoice the channel cannot carry. `keptFloor` 0 counts only the reserve
+ * the wallet enforces, the most the channel might carry.
  */
-export function inboundSats(c) {
+export function inboundSats(c, keptFloor = MIN_KEPT_RESERVE_SATS) {
 	const gross = Math.max(0, c.remoteBalanceSats || 0);
 	const reported = satsField(c.maxReceivableSats);
 	if (reported != null) return Math.min(gross, reported);
 	const enforced =
 		satsField(c.remoteReserveSats) ??
 		(c.remoteReserveWaived === true ? 0 : Math.ceil((satsField(c.capacitySats) || 0) / 100));
-	const reserve = enforced > 0 ? Math.max(enforced, MIN_KEPT_RESERVE_SATS) : 0;
+	const reserve = enforced > 0 ? Math.max(enforced, keptFloor) : 0;
 	const fee = c.isOpener === true ? 0 : funderBufferSats(c);
 	return Math.max(0, gross - reserve - fee);
 }
@@ -142,10 +143,10 @@ export function inboundSats(c) {
  * previous one. That channel stays open and keeps receiving until it is
  * moved, so a receive it can take needs no provisioning (wallet-core #18).
  */
-export function receivableSats(channels, primaryPubkey, previousPrimary) {
+export function receivableSats(channels, primaryPubkey, previousPrimary, keptFloor) {
 	return [...primaryChannels(channels, primaryPubkey), ...previousPrimaryChannels(channels, previousPrimary)]
 		.filter(usable)
-		.reduce((sum, c) => sum + inboundSats(c), 0);
+		.reduce((sum, c) => sum + inboundSats(c, keptFloor), 0);
 }
 
 /**
@@ -173,12 +174,17 @@ export function planInvoice({
 	const inbound = receivableSats(channels, primaryPubkey, previousPrimary);
 	const covered = wantedSats > 0 ? inbound >= wantedSats : inbound > 0;
 	if (covered) return { kind: 'plain' };
-	if (!primaryRunning) return { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-running' };
+	// Past the floored count, an amount within the reserve the wallet enforces
+	// fits a primary with a small dust limit. JIT is still preferred, since it
+	// covers any dust limit. Without JIT, a plain invoice may still settle, so
+	// it is minted instead of refusing the receive.
+	const mayFit = wantedSats > 0 && receivableSats(channels, primaryPubkey, previousPrimary, 0) >= wantedSats;
+	if (!primaryRunning) return mayFit ? { kind: 'plain' } : { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-running' };
 	// A primary whose daemon is up but whose peer connection is down (a Tor
 	// reestablish window, say) cannot provision either: the intent never
 	// reaches it, and the invoice would be minted only to fail.
-	if (!primaryConnected) return { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-connected' };
-	return { kind: 'jit' };
+	if (!primaryConnected) return mayFit ? { kind: 'plain' } : { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-connected' };
+	return mayFit ? { kind: 'jit', fallback: 'plain' } : { kind: 'jit' };
 }
 
 /**

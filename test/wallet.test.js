@@ -1148,6 +1148,14 @@ test("a small channel counts the reserve the primary keeps, not the lower one th
   assert.equal(planFor(27537, [small]), "jit");
   // The amount that failed against that primary.
   assert.equal(planFor(27899, [small]), "jit");
+  // Up to the 354 sats the wallet enforces, the channel may carry it: JIT
+  // first, a plain invoice when the primary cannot fund it or is away.
+  const plan = (wantedSats, primaryConnected) =>
+    planInvoice({ wantedSats, channels: [small], primaryPubkey: small.peerPubkey, setup: "ready", primaryConnected });
+  assert.deepEqual(plan(28244, true), { kind: "jit", fallback: "plain" });
+  assert.deepEqual(plan(28244, false), { kind: "plain" });
+  assert.deepEqual(plan(28245, true), { kind: "jit" });
+  assert.equal(plan(28245, false).code, "PRIMARY_DOWN");
 });
 
 test("an engine that reports no inbound limit or reserve falls back to a 1% reserve and a floor-rate fee", () => {
@@ -1206,6 +1214,31 @@ test("a receive past the usable limit asks the primary for JIT, and is refused w
     await assert.rejects(away.client.quoteReceive({ amountSats: 10000 }), { code: "PRIMARY_DOWN" });
     assert.deepEqual(receivePaths(away.calls), []);
   }
+});
+
+test("a receive within the reserve the wallet enforces stays plain when the primary cannot fund it", async () => {
+  // A primary with a 700-sat dust limit keeps 700 and forwards exactly
+  // 10,000 sats, while the count floors the 354-sat reserve at 1,062.
+  const small = { ...atLimit[0], remoteBalanceSats: 10700, remoteReserveSats: 354 };
+  const declined = { accepted: false, withinCeilings: true, reason: "Provider funding limit reached" };
+  const funded = { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12 };
+  for (const [overrides, paths] of [
+    [{ "/jit/quote": declined }, ["/jit/quote", "/invoice/create"]],
+    [{ "/jit/quote": { ...funded, withinCeilings: false } }, ["/jit/quote", "/invoice/create"]],
+    [{ "/peers": [] }, ["/invoice/create"]],
+    [{ "/jit/quote": funded }, ["/jit/quote", "/jit/invoice"]],
+  ]) {
+    const { client, calls } = fixture({ "/channels": [small], ...overrides });
+    assert.equal((await client.snapshot()).balance.receivableSats, 9638);
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal(quote.feeSats, paths.includes("/jit/invoice") ? 12 : 0);
+    await client.receive(quote);
+    assert.deepEqual(receivePaths(calls), paths);
+  }
+  // One sat past the enforced reserve, a declined quote is still refused.
+  const past = fixture({ "/channels": [{ ...small, remoteBalanceSats: 10353 }], "/jit/quote": declined });
+  await assert.rejects(past.client.quoteReceive({ amountSats: 10000 }), { code: "RECEIVE_UNAVAILABLE" });
+  assert.deepEqual(receivePaths(past.calls), ["/jit/quote"]);
 });
 
 test("embedded JIT quote timeout explains the provider check without creating an invoice or address", async () => {

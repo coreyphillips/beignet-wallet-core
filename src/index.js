@@ -3131,6 +3131,7 @@ export class WalletClient {
     let feeSats = 0;
     let feePolicy;
     const warnings = [];
+    let jitQuote;
     if (plan.kind === "jit") {
       requires(
         amount != null,
@@ -3138,12 +3139,18 @@ export class WalletClient {
         "AMOUNT_REQUIRED",
       );
       const query = `?${target ? `lspPubkey=${encodeURIComponent(target)}&` : ""}amountSats=${amount}&targetRemainingInboundSat=${INBOUND_HEADROOM_SATS}`;
-      let quote;
       try {
-        quote = await this._get("/jit/quote" + query);
+        jitQuote = await this._get("/jit/quote" + query);
       } catch (error) {
         throw jitReceiveError(error, "quote");
       }
+      // The existing channel may carry this amount (see planInvoice), so a
+      // primary that declines to fund it leaves a plain invoice to try.
+      if (plan.fallback === "plain" && !(jitQuote?.accepted === true && jitQuote?.withinCeilings === true))
+        plan = { kind: "plain" };
+    }
+    if (plan.kind === "jit") {
+      const quote = jitQuote;
       if (PUBKEY_RE.test(text(quote?.lspPubkey))) steered = { peer: text(quote.lspPubkey).toLowerCase(), skipped: quote.skipped };
       else if (target) steered = { peer: target };
       requires(
