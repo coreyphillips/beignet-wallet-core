@@ -1130,6 +1130,23 @@ test("a channel the primary funded keeps its commitment fee out of the receivabl
   assert.equal(inboundSats({ ...fundedChannel, isOpener: true }), 50000);
 });
 
+test("a small channel counts the reserve the primary keeps, not the lower one the wallet enforces", () => {
+  // A 30,000-sat v2 channel the primary opened: the wallet enforces 354 sats
+  // and the primary keeps 546, and the fee at 253 sat/kw is 1,402 sats.
+  const small = {
+    ...fundedChannel,
+    peerPubkey: reservedChannel.peerPubkey,
+    capacitySats: 30000,
+    remoteBalanceSats: 30000,
+    remoteReserveSats: 354,
+    remoteReserveWaived: false,
+    feeratePerKw: 253,
+  };
+  assert.equal(inboundSats(small), 28052);
+  assert.equal(planFor(28052, [small]), "plain");
+  assert.equal(planFor(28053, [small]), "jit");
+});
+
 test("an engine that reports no inbound limit or reserve falls back to a 1% reserve and a floor-rate fee", () => {
   const older = { ...channel, remoteBalanceSats: 100000, capacitySats: 300000 };
   // 3,000 sats of reserve, and (1124 + 2 * 172) weight at twice 253 sat/kw
