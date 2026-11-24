@@ -16,7 +16,10 @@ import {
 import { bech32Encode, convertBits } from "../src/payment-uri.js";
 import {
   arrivingFundsNote,
+  inboundSats,
   lfbwStatus,
+  planInvoice,
+  receivableSats,
   CHANNELIZE_FLOOR_SATS,
 } from "../src/lfbw.js";
 import {
@@ -1027,6 +1030,7 @@ test("receive after a primary switch reuses inbound on the previous primary's ch
   const { client, calls } = fixture({
     "/api/wallets": [switched],
     "/api/wallets/wallet-1": switched,
+    "/channels": [{ ...channel, isOpener: true, remoteReserveSats: 0 }],
     "/peers": [{ pubkey: NEW_PK, state: "connected" }],
   });
   const snapshot = await client.snapshot();
@@ -1068,6 +1072,173 @@ test("receive after a primary switch still plans JIT through the new primary whe
   assert.ok(jit);
   assert.equal(new URLSearchParams(jit.query).get("lspPubkey"), NEW_PK);
   assert.ok(!calls.some((c) => c.path === "/invoice/create"));
+});
+
+// The channel from wallet-core #51: 120,000 sats on the primary's side, of
+// which it must keep 2,400. The wallet opened it, so the primary pays no
+// commitment fee and 117,600 is exactly what it can forward.
+const reservedChannel = {
+  peerPubkey: "02" + "11".repeat(32),
+  state: "NORMAL",
+  htlcUsable: true,
+  remoteBalanceSats: 120000,
+  remoteReserveSats: 2400,
+  remoteReserveWaived: false,
+  localReserveWaived: true,
+  isOpener: true,
+};
+const planFor = (wantedSats, channels) =>
+  planInvoice({ wantedSats, channels, primaryPubkey: reservedChannel.peerPubkey, setup: "ready" }).kind;
+
+test("the receivable figure and the invoice plan stop at the reserve the primary keeps", () => {
+  assert.equal(receivableSats([reservedChannel], reservedChannel.peerPubkey), 117600);
+  assert.equal(planFor(90000, [reservedChannel]), "plain");
+  assert.equal(planFor(117600, [reservedChannel]), "plain");
+  assert.equal(planFor(117601, [reservedChannel]), "jit");
+  assert.equal(planFor(120000, [reservedChannel]), "jit");
+  assert.equal(planFor(120001, [reservedChannel]), "jit");
+  // The primary's waiver is the one that releases this side's reserve.
+  const waived = { ...reservedChannel, remoteReserveSats: 0, remoteReserveWaived: true, localReserveWaived: false };
+  assert.equal(inboundSats(waived), 120000);
+  assert.equal(planFor(120000, [waived]), "plain");
+  // A fully reserved channel adds nothing and takes nothing from another.
+  const empty = { ...reservedChannel, remoteBalanceSats: 1000 };
+  assert.equal(inboundSats(empty), 0);
+  assert.equal(receivableSats([reservedChannel, empty], reservedChannel.peerPubkey), 117600);
+});
+
+// Reserve waived, so only the funder's fee-spike buffer stands between the
+// balance and the limit: (1124 + 2 * 172) weight at twice 1,000 sat/kw plus
+// the 660 sats of anchors is 3,596 sats.
+const fundedChannel = {
+  ...channel,
+  remoteBalanceSats: 50000,
+  remoteReserveSats: 0,
+  remoteReserveWaived: true,
+  isOpener: false,
+  isAnchor: true,
+  feeratePerKw: 1000,
+  htlcCount: 0,
+};
+
+test("a channel the primary funded keeps its commitment fee out of the receivable figure", () => {
+  assert.equal(inboundSats(fundedChannel), 46404);
+  assert.equal(planFor(46404, [{ ...fundedChannel, peerPubkey: reservedChannel.peerPubkey }]), "plain");
+  assert.equal(planFor(46405, [{ ...fundedChannel, peerPubkey: reservedChannel.peerPubkey }]), "jit");
+  assert.equal(inboundSats({ ...fundedChannel, htlcCount: 3 }), 46404 - 3 * 344);
+  assert.equal(inboundSats({ ...fundedChannel, isAnchor: false }), 50000 - 2136);
+  assert.equal(inboundSats({ ...fundedChannel, isOpener: true }), 50000);
+});
+
+test("a small channel counts the reserve the primary keeps, not the lower one the wallet enforces", () => {
+  // A 30,000-sat v2 channel the primary opened: the wallet enforces 354 sats,
+  // but a primary with a 700-sat dust limit keeps 700. The count takes the
+  // 1,062-sat dust ceiling, and the fee at 253 sat/kw is 1,402 sats.
+  const small = {
+    ...fundedChannel,
+    peerPubkey: reservedChannel.peerPubkey,
+    capacitySats: 30000,
+    remoteBalanceSats: 30000,
+    remoteReserveSats: 354,
+    remoteReserveWaived: false,
+    feeratePerKw: 253,
+  };
+  assert.equal(inboundSats(small), 27536);
+  assert.equal(planFor(27536, [small]), "plain");
+  assert.equal(planFor(27537, [small]), "jit");
+  // The amount that failed against that primary.
+  assert.equal(planFor(27899, [small]), "jit");
+  // Up to the 354 sats the wallet enforces, the channel may carry it: JIT
+  // first, a plain invoice when the primary cannot fund it or is away.
+  const plan = (wantedSats, primaryConnected) =>
+    planInvoice({ wantedSats, channels: [small], primaryPubkey: small.peerPubkey, setup: "ready", primaryConnected });
+  assert.deepEqual(plan(28244, true), { kind: "jit", fallback: "plain" });
+  assert.deepEqual(plan(28244, false), { kind: "plain" });
+  assert.deepEqual(plan(28245, true), { kind: "jit" });
+  assert.equal(plan(28245, false).code, "PRIMARY_DOWN");
+});
+
+test("an engine that reports no inbound limit or reserve falls back to a 1% reserve and a floor-rate fee", () => {
+  const older = { ...channel, remoteBalanceSats: 100000, capacitySats: 300000 };
+  // 3,000 sats of reserve, and (1124 + 2 * 172) weight at twice 253 sat/kw
+  // plus anchors is 1,402 sats, since nothing says the wallet opened it.
+  assert.equal(inboundSats(older), 95598);
+  assert.equal(inboundSats({ ...older, remoteReserveWaived: true }), 98598);
+  // The engine's own limit wins, but never past the primary's balance.
+  assert.equal(inboundSats({ ...older, maxReceivableSats: 99000 }), 99000);
+  assert.equal(inboundSats({ ...older, maxReceivableSats: 150000 }), 100000);
+  assert.equal(inboundSats({ ...older, maxReceivableSats: -1 }), 95598);
+});
+
+// Each sized so the fixture invoice's 10,000 sats is exactly the usable limit.
+const atLimit = [
+  { ...channel, ...reservedChannel, peerPubkey: PK, remoteBalanceSats: 12400 },
+  { ...channel, ...reservedChannel, peerPubkey: PK, remoteBalanceSats: 10000, remoteReserveSats: 0, remoteReserveWaived: true, localReserveWaived: false },
+  { ...fundedChannel, remoteBalanceSats: 13596 },
+];
+// Each short of 10,000: one sat above the limit, the gross balance with only
+// the wallet's own reserve waived, and a shortfall that is the fee alone.
+const pastLimit = [
+  { ...atLimit[0], remoteBalanceSats: 12399 },
+  { ...atLimit[0], remoteBalanceSats: 10000 },
+  { ...atLimit[2], remoteBalanceSats: 13595 },
+];
+const receivePaths = (calls) =>
+  calls.filter((c) => ["/jit/quote", "/jit/invoice", "/invoice/create"].includes(c.path)).map((c) => c.path);
+
+test("a receive at the usable limit is a plain invoice, with the primary away too", async () => {
+  for (const ch of atLimit) {
+    for (const peers of [[{ pubkey: PK, state: "connected" }], []]) {
+      const { client, calls } = fixture({ "/channels": [ch], "/peers": peers });
+      assert.equal((await client.snapshot()).balance.receivableSats, 10000);
+      const quote = await client.quoteReceive({ amountSats: 10000 });
+      assert.equal(quote.feeSats, 0);
+      await client.receive(quote);
+      assert.deepEqual(receivePaths(calls), ["/invoice/create"]);
+    }
+  }
+});
+
+test("a receive past the usable limit asks the primary for JIT, and is refused while it is away", async () => {
+  for (const ch of pastLimit) {
+    const { client, calls } = fixture({
+      "/channels": [ch],
+      "/jit/quote": { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12 },
+    });
+    assert.ok((await client.snapshot()).balance.receivableSats < 10000);
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal(quote.feeSats, 12);
+    await client.receive(quote);
+    assert.deepEqual(receivePaths(calls), ["/jit/quote", "/jit/invoice"]);
+    const away = fixture({ "/channels": [ch], "/peers": [] });
+    await assert.rejects(away.client.quoteReceive({ amountSats: 10000 }), { code: "PRIMARY_DOWN" });
+    assert.deepEqual(receivePaths(away.calls), []);
+  }
+});
+
+test("a receive within the reserve the wallet enforces stays plain when the primary cannot fund it", async () => {
+  // A primary with a 700-sat dust limit keeps 700 and forwards exactly
+  // 10,000 sats, while the count floors the 354-sat reserve at 1,062.
+  const small = { ...atLimit[0], remoteBalanceSats: 10700, remoteReserveSats: 354 };
+  const declined = { accepted: false, withinCeilings: true, reason: "Provider funding limit reached" };
+  const funded = { accepted: true, withinCeilings: true, flatFeeSat: 10, feePpm: 101, feeSats: 12 };
+  for (const [overrides, paths] of [
+    [{ "/jit/quote": declined }, ["/jit/quote", "/invoice/create"]],
+    [{ "/jit/quote": { ...funded, withinCeilings: false } }, ["/jit/quote", "/invoice/create"]],
+    [{ "/peers": [] }, ["/invoice/create"]],
+    [{ "/jit/quote": funded }, ["/jit/quote", "/jit/invoice"]],
+  ]) {
+    const { client, calls } = fixture({ "/channels": [small], ...overrides });
+    assert.equal((await client.snapshot()).balance.receivableSats, 9638);
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal(quote.feeSats, paths.includes("/jit/invoice") ? 12 : 0);
+    await client.receive(quote);
+    assert.deepEqual(receivePaths(calls), paths);
+  }
+  // One sat past the enforced reserve, a declined quote is still refused.
+  const past = fixture({ "/channels": [{ ...small, remoteBalanceSats: 10353 }], "/jit/quote": declined });
+  await assert.rejects(past.client.quoteReceive({ amountSats: 10000 }), { code: "RECEIVE_UNAVAILABLE" });
+  assert.deepEqual(receivePaths(past.calls), ["/jit/quote"]);
 });
 
 test("embedded JIT quote timeout explains the provider check without creating an invoice or address", async () => {
@@ -5319,7 +5490,7 @@ test("concurrent ACTIVE and DRAINING reservations preserve authoritative ordinar
     const { client } = embeddedFixture({
       "/balance": { onchain: 0, lightning: 200000, splicingSats: 0 },
       "/liquidity": { sendableSats: 190000 },
-      "/channels": [{ ...channel, remoteBalanceSats: 80000, ffor: {
+      "/channels": [{ ...channel, remoteBalanceSats: 80000, isOpener: true, remoteReserveSats: 0, ffor: {
         state, concurrent: true, concurrentVersion: 2, reservedInboundSats: 20000, unresolvedSlots: 1,
       } }],
       "/receive/offline": { maxSats: 0, available: true, reason: null },

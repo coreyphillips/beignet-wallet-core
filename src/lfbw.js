@@ -78,16 +78,75 @@ export function previousPrimaryChannels(channels, previousPrimary) {
 	return primaryChannels(channels, previousPrimary.pubkey);
 }
 
+// BOLT 3 commitment weights and the two 330-sat anchor outputs a funder
+// pays for. A taproot channel (968), or one whose type is not reported, is
+// priced at the anchor weight: the channel list does not tell them apart,
+// and the heavier one errs low.
+const COMMITMENT_WEIGHT = 724;
+const ANCHOR_COMMITMENT_WEIGHT = 1124;
+const HTLC_OUTPUT_WEIGHT = 172;
+const ANCHOR_OUTPUTS_SATS = 660;
+// The lowest commitment feerate a peer accepts, for an engine that does not
+// report the channel's own.
+const FLOOR_FEERATE_PER_KW = 253;
+// The least a primary keeps of any reserve at all. A primary keeps the
+// greater of the reserve and its own dust limit, which the engine does not
+// report and which on a small channel can exceed the reserve. 1,062 sats is
+// the highest dust limit the engine accepts from a peer (beignet's
+// MAX_DUST_LIMIT_SATOSHIS), so no primary keeps more than this floor.
+const MIN_KEPT_RESERVE_SATS = 1062;
+
+const satsField = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
+
+/**
+ * The commitment fee a funding peer keeps back before it forwards an HTLC:
+ * twice the live feerate with room for one HTLC beyond the one being added,
+ * plus the anchors. That is the fee-spike buffer a beignet or LND funder
+ * holds, and an HTLC past it is never offered.
+ */
+function funderBufferSats(c) {
+	const feerate = satsField(c.feeratePerKw) || FLOOR_FEERATE_PER_KW;
+	const htlcs = (satsField(c.htlcCount) || 0) + 2;
+	const weight = (c.isAnchor === false ? COMMITMENT_WEIGHT : ANCHOR_COMMITMENT_WEIGHT) + HTLC_OUTPUT_WEIGHT * htlcs;
+	return Math.floor((weight * feerate * 2) / 1000) + (c.isAnchor === false ? 0 : ANCHOR_OUTPUTS_SATS);
+}
+
+/**
+ * What one channel can take from its peer in a new incoming payment: the
+ * engine's own figure when it reports one. Otherwise it is the peer's balance
+ * less the reserve this wallet holds the peer to (`remoteReserveSats`), never
+ * taken as less than the 1,062 sats a primary may keep of a nonzero one. The
+ * wallet's own waiver, `localReserveWaived`, releases nothing on this side.
+ * Unless this wallet opened the channel, the fee the peer keeps as its funder
+ * comes off too. An engine without the reserve fields is taken to reserve 1%
+ * of capacity, the BOLT 2 default. One that does not say who opened is taken
+ * to be on a channel the primary opened, which is how a JIT channel starts.
+ * Both fallbacks err low: that costs a JIT quote, where erring high mints an
+ * invoice the channel cannot carry. `keptFloor` 0 counts only the reserve
+ * the wallet enforces, the most the channel might carry.
+ */
+export function inboundSats(c, keptFloor = MIN_KEPT_RESERVE_SATS) {
+	const gross = Math.max(0, c.remoteBalanceSats || 0);
+	const reported = satsField(c.maxReceivableSats);
+	if (reported != null) return Math.min(gross, reported);
+	const enforced =
+		satsField(c.remoteReserveSats) ??
+		(c.remoteReserveWaived === true ? 0 : Math.ceil((satsField(c.capacitySats) || 0) / 100));
+	const reserve = enforced > 0 ? Math.max(enforced, keptFloor) : 0;
+	const fee = c.isOpener === true ? 0 : funderBufferSats(c);
+	return Math.max(0, gross - reserve - fee);
+}
+
 /**
  * What the wallet can receive over its live channels as they stand: the
  * usable channels with the current primary and, after a re-point, with the
  * previous one. That channel stays open and keeps receiving until it is
  * moved, so a receive it can take needs no provisioning (wallet-core #18).
  */
-export function receivableSats(channels, primaryPubkey, previousPrimary) {
+export function receivableSats(channels, primaryPubkey, previousPrimary, keptFloor) {
 	return [...primaryChannels(channels, primaryPubkey), ...previousPrimaryChannels(channels, previousPrimary)]
 		.filter(usable)
-		.reduce((sum, c) => sum + (c.remoteBalanceSats || 0), 0);
+		.reduce((sum, c) => sum + inboundSats(c, keptFloor), 0);
 }
 
 /**
@@ -115,12 +174,17 @@ export function planInvoice({
 	const inbound = receivableSats(channels, primaryPubkey, previousPrimary);
 	const covered = wantedSats > 0 ? inbound >= wantedSats : inbound > 0;
 	if (covered) return { kind: 'plain' };
-	if (!primaryRunning) return { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-running' };
+	// Past the floored count, an amount within the reserve the wallet enforces
+	// fits a primary with a small dust limit. JIT is still preferred, since it
+	// covers any dust limit. Without JIT, a plain invoice may still settle, so
+	// it is minted instead of refusing the receive.
+	const mayFit = wantedSats > 0 && receivableSats(channels, primaryPubkey, previousPrimary, 0) >= wantedSats;
+	if (!primaryRunning) return mayFit ? { kind: 'plain' } : { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-running' };
 	// A primary whose daemon is up but whose peer connection is down (a Tor
 	// reestablish window, say) cannot provision either: the intent never
 	// reaches it, and the invoice would be minted only to fail.
-	if (!primaryConnected) return { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-connected' };
-	return { kind: 'jit' };
+	if (!primaryConnected) return mayFit ? { kind: 'plain' } : { kind: 'refuse', code: 'PRIMARY_DOWN', reason: 'not-connected' };
+	return mayFit ? { kind: 'jit', fallback: 'plain' } : { kind: 'jit' };
 }
 
 /**
