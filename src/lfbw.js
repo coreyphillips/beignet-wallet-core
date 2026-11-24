@@ -89,10 +89,12 @@ const ANCHOR_OUTPUTS_SATS = 660;
 // The lowest commitment feerate a peer accepts, for an engine that does not
 // report the channel's own.
 const FLOOR_FEERATE_PER_KW = 253;
-// The least a primary keeps of any reserve at all: beignet keeps at least
-// this on a v2 channel and LND enforces it too. The engine reports the reserve
-// this wallet enforces, which on a small v2 channel can be lower.
-const MIN_KEPT_RESERVE_SATS = 546;
+// The least a primary keeps of any reserve at all. A primary keeps the
+// greater of the reserve and its own dust limit, which the engine does not
+// report and which on a small channel can exceed the reserve. 1,062 sats is
+// the highest dust limit the engine accepts from a peer (beignet's
+// MAX_DUST_LIMIT_SATOSHIS), so no primary keeps more than this floor.
+const MIN_KEPT_RESERVE_SATS = 1062;
 
 const satsField = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
 
@@ -113,7 +115,7 @@ function funderBufferSats(c) {
  * What one channel can take from its peer in a new incoming payment: the
  * engine's own figure when it reports one. Otherwise it is the peer's balance
  * less the reserve this wallet holds the peer to (`remoteReserveSats`), never
- * taken as less than the 546 sats a primary keeps of a nonzero one. The
+ * taken as less than the 1,062 sats a primary may keep of a nonzero one. The
  * wallet's own waiver, `localReserveWaived`, releases nothing on this side.
  * Unless this wallet opened the channel, the fee the peer keeps as its funder
  * comes off too. An engine without the reserve fields is taken to reserve 1%
