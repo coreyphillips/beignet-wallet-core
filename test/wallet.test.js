@@ -1082,6 +1082,7 @@ const reservedChannel = {
   state: "NORMAL",
   htlcUsable: true,
   remoteBalanceSats: 120000,
+  localBalanceSats: 10000,
   remoteReserveSats: 2400,
   remoteReserveWaived: false,
   localReserveWaived: true,
@@ -1130,6 +1131,30 @@ test("a channel the primary funded keeps its commitment fee out of the receivabl
   assert.equal(inboundSats({ ...fundedChannel, isOpener: true }), 50000);
 });
 
+test("a channel the wallet funded takes nothing until the wallet can pay for the commitment", () => {
+  // 118,000 of 120,000 sats pushed to the primary, 1,200 reserved on each
+  // side. One more HTLC at 253 sat/kw on an anchor commitment costs
+  // (1124 + 172) * 253 / 1000 + 660 = 987 sats, which the wallet pays.
+  const opened = {
+    ...reservedChannel,
+    capacitySats: 120000,
+    remoteBalanceSats: 118000,
+    localBalanceSats: 2187,
+    remoteReserveSats: 1200,
+    localReserveSats: 1200,
+    localReserveWaived: false,
+    isAnchor: true,
+    feeratePerKw: 253,
+    htlcCount: 0,
+  };
+  assert.equal(inboundSats(opened), 116800);
+  assert.equal(inboundSats({ ...opened, localBalanceSats: 2186 }), 0);
+  assert.equal(planFor(10000, [{ ...opened, localBalanceSats: 2000 }]), "jit");
+  // Without the reserve field, the wallet keeps 1% of capacity.
+  assert.equal(inboundSats({ ...opened, localReserveSats: undefined }), 116800);
+  assert.equal(inboundSats({ ...opened, localReserveSats: undefined, localBalanceSats: 2186 }), 0);
+});
+
 test("a small channel counts the reserve the primary keeps, not the lower one the wallet enforces", () => {
   // A 30,000-sat v2 channel the primary opened: the wallet enforces 354 sats,
   // but a primary with a 700-sat dust limit keeps 700. The count takes the
@@ -1175,13 +1200,16 @@ const atLimit = [
   { ...channel, ...reservedChannel, peerPubkey: PK, remoteBalanceSats: 12400 },
   { ...channel, ...reservedChannel, peerPubkey: PK, remoteBalanceSats: 10000, remoteReserveSats: 0, remoteReserveWaived: true, localReserveWaived: false },
   { ...fundedChannel, remoteBalanceSats: 13596 },
+  { ...channel, ...reservedChannel, peerPubkey: PK, remoteBalanceSats: 12400, localBalanceSats: 987 },
 ];
 // Each short of 10,000: one sat above the limit, the gross balance with only
-// the wallet's own reserve waived, and a shortfall that is the fee alone.
+// the wallet's own reserve waived, a shortfall that is the fee alone, and a
+// wallet that funded the channel but cannot pay for the commitment.
 const pastLimit = [
   { ...atLimit[0], remoteBalanceSats: 12399 },
   { ...atLimit[0], remoteBalanceSats: 10000 },
   { ...atLimit[2], remoteBalanceSats: 13595 },
+  { ...atLimit[3], localBalanceSats: 986 },
 ];
 const receivePaths = (calls) =>
   calls.filter((c) => ["/jit/quote", "/jit/invoice", "/invoice/create"].includes(c.path)).map((c) => c.path);
@@ -6446,6 +6474,21 @@ test("a steered offline quote binds its request to the primary that quoted it, a
     await assert.rejects(none.quoteReceive({ amountSats: 10000 }), (error) => error.code === "NO_PRIMARY_AVAILABLE" && /declined/.test(error.message));
     const { client: down } = makeClient(rankedOverrides({ "/channels": [], "/peers": [] }));
     await assert.rejects(down.quoteReceive({ amountSats: 10000 }), { code: "PRIMARY_DOWN" });
+  }
+});
+
+test("a ranked engine that finds no primary to fund a receive the channel may carry leaves a plain invoice", async () => {
+  // Within the 354 sats the wallet enforces, but past the 1,062-sat floor.
+  const small = { ...atLimit[0], remoteBalanceSats: 10700, remoteReserveSats: 354 };
+  for (const makeClient of [fixture, embeddedFixture]) {
+    const { client, calls } = makeClient(rankedOverrides({
+      "/channels": [small],
+      "/jit/quote": { response: result({ ok: false, error: { code: "NO_PRIMARY_AVAILABLE", message: "no primary took the receive: 1 declined" } }, 503) },
+    }));
+    const quote = await client.quoteReceive({ amountSats: 10000 });
+    assert.equal(quote.feeSats, 0);
+    await client.receive(quote);
+    assert.deepEqual(receivePaths(calls), ["/jit/quote", "/invoice/create"]);
   }
 });
 

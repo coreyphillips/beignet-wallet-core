@@ -99,17 +99,22 @@ const MIN_KEPT_RESERVE_SATS = 1062;
 const satsField = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
 
 /**
- * The commitment fee a funding peer keeps back before it forwards an HTLC:
- * twice the live feerate with room for one HTLC beyond the one being added,
- * plus the anchors. That is the fee-spike buffer a beignet or LND funder
- * holds, and an HTLC past it is never offered.
+ * The funder's cost of the commitment with `addedHtlcs` more HTLC outputs at
+ * `feerateMultiple` times the live feerate, plus the anchors. A funding
+ * primary keeps back 2 HTLCs at twice the rate (the fee-spike buffer a
+ * beignet or LND funder holds). When the wallet funds, the primary offers
+ * nothing unless the wallet can pay for 1 more HTLC at the live rate
+ * (BOLT 2).
  */
-function funderBufferSats(c) {
-	const feerate = satsField(c.feeratePerKw) || FLOOR_FEERATE_PER_KW;
-	const htlcs = (satsField(c.htlcCount) || 0) + 2;
+function commitmentFeeSats(c, addedHtlcs, feerateMultiple) {
+	const feerate = (satsField(c.feeratePerKw) || FLOOR_FEERATE_PER_KW) * feerateMultiple;
+	const htlcs = (satsField(c.htlcCount) || 0) + addedHtlcs;
 	const weight = (c.isAnchor === false ? COMMITMENT_WEIGHT : ANCHOR_COMMITMENT_WEIGHT) + HTLC_OUTPUT_WEIGHT * htlcs;
-	return Math.floor((weight * feerate * 2) / 1000) + (c.isAnchor === false ? 0 : ANCHOR_OUTPUTS_SATS);
+	return Math.floor((weight * feerate) / 1000) + (c.isAnchor === false ? 0 : ANCHOR_OUTPUTS_SATS);
 }
+
+const reserveSats = (reported, waived, capacity) =>
+	satsField(reported) ?? (waived === true ? 0 : Math.ceil((satsField(capacity) || 0) / 100));
 
 /**
  * What one channel can take from its peer in a new incoming payment: the
@@ -118,10 +123,12 @@ function funderBufferSats(c) {
  * taken as less than the 1,062 sats a primary may keep of a nonzero one. The
  * wallet's own waiver, `localReserveWaived`, releases nothing on this side.
  * Unless this wallet opened the channel, the fee the peer keeps as its funder
- * comes off too. An engine without the reserve fields is taken to reserve 1%
- * of capacity, the BOLT 2 default. One that does not say who opened is taken
- * to be on a channel the primary opened, which is how a JIT channel starts.
- * Both fallbacks err low: that costs a JIT quote, where erring high mints an
+ * comes off too. If it did, the channel takes nothing until the wallet's
+ * balance above its own reserve pays for the commitment with the new HTLC.
+ * An engine without the reserve fields is taken to reserve 1% of capacity,
+ * the BOLT 2 default. One that does not say who opened is taken to be on a
+ * channel the primary opened, which is how a JIT channel starts. Both
+ * fallbacks err low: that costs a JIT quote, where erring high mints an
  * invoice the channel cannot carry. `keptFloor` 0 counts only the reserve
  * the wallet enforces, the most the channel might carry.
  */
@@ -129,11 +136,13 @@ export function inboundSats(c, keptFloor = MIN_KEPT_RESERVE_SATS) {
 	const gross = Math.max(0, c.remoteBalanceSats || 0);
 	const reported = satsField(c.maxReceivableSats);
 	if (reported != null) return Math.min(gross, reported);
-	const enforced =
-		satsField(c.remoteReserveSats) ??
-		(c.remoteReserveWaived === true ? 0 : Math.ceil((satsField(c.capacitySats) || 0) / 100));
+	if (c.isOpener === true) {
+		const spare = (c.localBalanceSats || 0) - reserveSats(c.localReserveSats, c.localReserveWaived, c.capacitySats);
+		if (spare < commitmentFeeSats(c, 1, 1)) return 0;
+	}
+	const enforced = reserveSats(c.remoteReserveSats, c.remoteReserveWaived, c.capacitySats);
 	const reserve = enforced > 0 ? Math.max(enforced, keptFloor) : 0;
-	const fee = c.isOpener === true ? 0 : funderBufferSats(c);
+	const fee = c.isOpener === true ? 0 : commitmentFeeSats(c, 2, 2);
 	return Math.max(0, gross - reserve - fee);
 }
 

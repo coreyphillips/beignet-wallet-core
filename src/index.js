@@ -3142,10 +3142,11 @@ export class WalletClient {
       try {
         jitQuote = await this._get("/jit/quote" + query);
       } catch (error) {
-        throw jitReceiveError(error, "quote");
+        if (plan.fallback !== "plain") throw jitReceiveError(error, "quote");
       }
       // The existing channel may carry this amount (see planInvoice), so a
-      // primary that declines to fund it leaves a plain invoice to try.
+      // primary that declines to fund it, or a ranked engine that finds none
+      // that will, leaves a plain invoice to try.
       if (plan.fallback === "plain" && !(jitQuote?.accepted === true && jitQuote?.withinCeilings === true))
         plan = { kind: "plain" };
     }
