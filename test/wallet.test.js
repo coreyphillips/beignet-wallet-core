@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   WalletClient,
   EmbeddedWalletClient,
+  EmbeddedTransportError,
   DemoWalletClient,
   DEFAULT_PRIMARY_URI,
   LIGHTNING_FEE_HEADROOM_SATS,
@@ -4707,6 +4708,30 @@ test("a pre-witness refusal spends nothing, and the next review pays the address
     assert.equal(calls.filter((c) => c.path === "/direct-funding/send").length, 1);
     assert.equal(calls.filter((c) => c.path === "/channel/splice-out").length, 1);
   }
+});
+
+test("losing the embedded reply after signing keeps the funding envelope locked", async () => {
+  const { client, calls } = embeddedFixture({
+    "/utxos": CONFIRMED_COIN,
+    "/direct-funding/send": { status: "SIGNED_PENDING", fundingTxid: "ef".repeat(32) },
+  });
+  const request = client._runtime.request.bind(client._runtime);
+  client._runtime.request = async command => {
+    const result = await request(command);
+    if (command.path.endsWith("/direct-funding/send")) {
+      assert.equal(result.status, "SIGNED_PENDING");
+      throw new EmbeddedTransportError();
+    }
+    return result;
+  };
+  const pay = () => client.prepareSend({ request: FUNDING_URI() });
+  const sent = await client.send(await pay());
+  assert.equal(sent.status, "uncertain");
+  const next = await pay();
+  assert.equal(next.method, "direct-funding");
+  await assert.rejects(client.send(next), { code: "ALREADY_SUBMITTED" });
+  assert.equal(calls.filter(call => call.path === "/direct-funding/send").length, 1);
+  assert.ok(!calls.some(call => call.path === "/channel/splice-out"));
 });
 
 test("a lost host connection during a direct funding stays uncertain and is never retried", async () => {

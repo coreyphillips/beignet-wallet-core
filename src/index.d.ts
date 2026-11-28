@@ -751,6 +751,8 @@ export interface EmbeddedRuntimeRequest {
   body?: unknown;
 }
 /** Local engine or worker RPC. Raw route results; never a remote wallet host. */
+/** Throw this when the adapter cannot recover the engine reply, including after dispatch. */
+export class EmbeddedTransportError extends Error {}
 export interface EmbeddedRuntime {
   request(request: EmbeddedRuntimeRequest): unknown | Promise<unknown>;
   close?(): void | Promise<void>;

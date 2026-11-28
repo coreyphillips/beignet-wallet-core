@@ -78,6 +78,9 @@ const asTime = (value) => {
   const n = Number(value) || 0;
   return n > 0 && n < 1e12 ? n * 1000 : n;
 };
+/** The adapter lost the reply from a separate wallet runtime. */
+export class EmbeddedTransportError extends Error {}
+
 export class WalletError extends Error {
   constructor(message, code = "WALLET_ERROR", status) {
     super(message);
@@ -2962,10 +2965,9 @@ export class WalletClient {
         description: boundedDescription(review.description),
       });
     } catch (error) {
-      // In-process, every throw is pre-witness by the engine's contract. Over
-      // a host connection only a coded refusal is certain; a lost connection
-      // is not, and stays uncertain like any other lost payment response.
-      if (this.embedded || knownRefusal(error)) {
+      // A rejection returned by the embedded engine is pre-witness. Its
+      // worker transport can also disconnect after the witness has left.
+      if ((this.embedded && !(error.cause instanceof EmbeddedTransportError)) || knownRefusal(error)) {
         answer = error instanceof Error ? error : new Error(String(error));
       } else {
         return {
@@ -4833,11 +4835,13 @@ export class EmbeddedWalletClient extends WalletClient {
       const code =
         text(error?.code) ||
         (readOnly ? "ENGINE_UNAVAILABLE" : "RESULT_UNCERTAIN");
-      throw new WalletError(
+      const failure = new WalletError(
         message,
         code,
         typeof error?.status === "number" ? error.status : undefined,
       );
+      if (error instanceof EmbeddedTransportError) failure.cause = error;
+      throw failure;
     }
   }
   async close() {
